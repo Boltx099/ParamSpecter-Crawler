@@ -15,7 +15,7 @@ This tool is intended for authorized security testing and educational purposes o
 
 ---
 ## Features
-
+```
 - Multi-threaded crawling engine  
 - Depth-based crawling  
 - Robots.txt support (optional)  
@@ -29,7 +29,7 @@ This tool is intended for authorized security testing and educational purposes o
 - WAF detection  
 - Security headers analysis  
 - JSON and CSV output  
-
+```
 ---
 ## How It Works
 
@@ -58,11 +58,12 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0  
 
 Usage:
-
-python ParamSpecter.py https://example.com  
+```bash
+python ParamSpecter.py https://example.com
+```
 
 Options:
-
+```
 -m, --max-pages     Maximum pages to crawl (default: 50)  
 -d, --delay         Delay between requests (default: 0.8)  
 -D, --depth         Crawl depth (default: 3)  
@@ -72,11 +73,13 @@ Options:
 --follow-external   Crawl external links  
 --ignore-robots     Ignore robots.txt rules  
 -u, --user-agent    Custom user agent  
-
+```
 Example:
 
+```
 python ParamSpecter.py https://testphp.vulnweb.com -D 2 -t 5  
 
+```
 ---
 ## Project Structure
 
