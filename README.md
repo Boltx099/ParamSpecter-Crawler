@@ -2,120 +2,118 @@
   <img src="banner.png" alt="ParamSpecter Banner" width="100%">
 </p>
 
-# ParamSpecter-Crawler
+---
+
+# ParamSpecter
 
 ParamSpecter is an advanced reconnaissance web crawler designed for bug bounty hunting and cybersecurity research. It performs deep crawling of web applications, extracts endpoints, analyzes JavaScript files, detects sensitive information, and generates structured outputs for further testing.
 
 ---
-
 ## Disclaimer
 
 This tool is intended for authorized security testing and educational purposes only. Do not use ParamSpecter on systems without proper permission.
 
 ---
-
 ## Features
 
-- Multi-threaded crawling engine
-- Depth-based crawling
-- Robots.txt support (optional)
-- Internal and external link discovery
-- Parameter detection (?id=, ?search=, etc.)
-- JavaScript file extraction
-- Deep JavaScript endpoint analysis
-- Secret detection:
-  - API keys
-  - Tokens
-  - Bearer authentication
-  - AWS keys
-- Email, IP, and subdomain extraction
-- Technology fingerprinting
-- WAF detection
-- Security headers analysis
-- JSON and CSV output
+- Multi-threaded crawling engine  
+- Depth-based crawling  
+- Robots.txt support (optional)  
+- Internal and external link discovery  
+- Parameter detection (`?id=`, `?search=` etc.)  
+- JavaScript file extraction  
+- Deep JavaScript endpoint analysis  
+- Secret detection (API keys, tokens, bearer authentication, AWS keys)  
+- Email, IP, and subdomain extraction  
+- Technology fingerprinting  
+- WAF detection  
+- Security headers analysis  
+- JSON and CSV output  
 
 ---
-
 ## How It Works
 
-### 1. Initialization
+ParamSpecter works by initializing a queue-based crawling system with multiple threads. Each worker fetches URLs, checks if they were visited, respects robots.txt (optional), sends HTTP requests, and parses responses. Pages are analyzed using `analyze_page(url, resp, soup, raw_html)` to extract metadata, links, endpoints, and sensitive information.
 
-ParamSpecter starts by taking a target URL and initializing:
+JavaScript files are extracted using `<script src="...">`, downloaded, and scanned for hidden endpoints such as `/api/login`, `/api/v1/user`, `/admin/dashboard`, and `/auth/token`. It also detects secrets like API keys, tokens, bearer authentication, and AWS keys (e.g., `api_key=abcd1234`, `Bearer eyJhbGciOi...`, `AKIA...`).
 
-- A queue-based crawling system
-- Thread workers
-- Depth and page limits
-- HTTP session with headers
+Collected data includes URLs, parameters, emails, IPs, subdomains, technologies, WAF indicators, and security headers. Results are saved in JSON and CSV formats (e.g., `paramspecter_example_com_20260101.json`).
 
 ---
+## Installation, Requirements, Usage and Options
 
-### 2. Crawling Engine
+Clone the repository, install dependencies, and run:
 
-The crawler uses multiple threads. Each worker:
+git clone https://github.com/Boltx099/ParamSpecter-Crawler
+cd ParamSpecter  
+pip install -r requirements.txt  
 
-1. Fetches a URL from the queue
-2. Checks if it was already visited
-3. Verifies robots.txt rules (if enabled)
-4. Sends an HTTP request
-5. Parses the response
+Requirements:
 
----
+requests>=2.31.0  
+beautifulsoup4>=4.12.0  
 
-### 3. Page Analysis
+Usage:
 
-Each page is processed using:
+python ParamSpecter.py https://example.com  
 
-analyze_page(url, resp, soup, raw_html)
+Options:
 
-This function extracts:
+-m, --max-pages     Maximum pages to crawl (default: 50)  
+-d, --delay         Delay between requests (default: 0.8)  
+-D, --depth         Crawl depth (default: 3)  
+-t, --threads       Number of threads (default: 5)  
+--timeout           Request timeout (default: 10)  
+-o, --output        Output format (json, csv, both)  
+--follow-external   Crawl external links  
+--ignore-robots     Ignore robots.txt rules  
+-u, --user-agent    Custom user agent  
 
-#### Basic Information
-- Status code
-- Content type
-- Server headers
-- Redirect chain
+Example:
 
-#### Metadata
-- Page title
-- Meta description
-
-#### Links
-- Internal links
-- External links
-- Social media links
+python ParamSpecter.py https://testphp.vulnweb.com -D 2 -t 5  
 
 ---
-### 4. JavaScript Analysis
+## Project Structure
 
-ParamSpecter extracts JavaScript files from HTML:
+ParamSpecter.py      Main crawler script  
+requirements.txt     Dependencies  
+README.md            Documentation  
 
-<script src="...">
+---
+## Use Cases
 
-Then downloads and scans them for:
+- Bug bounty reconnaissance  
+- Endpoint discovery  
+- Parameter identification  
+- JavaScript analysis  
+- Sensitive data exposure detection  
+- Web application mapping  
 
-- Hidden API endpoints
-- Internal routes
+---
+## Limitations
 
-Examples:
-- /api/login
-- /api/v1/user
-- /admin/dashboard
-- /auth/token### 4. JavaScript Analysis
+- Does not execute JavaScript  
+- May miss dynamic content  
+- Regex-based detection may produce false positives  
 
-ParamSpecter extracts JavaScript files from HTML:
+---
+## Future Improvements
 
-<script src="...">
+- Headless browser support (Playwright)  
+- Advanced parameter fuzzing  
+- Secret validation  
+- Subdomain enumeration  
+- Integration with tools like ffuf and nuclei  
 
-Then downloads and scans them for:
+---
+## Author
 
-- Hidden API endpoints
-- Internal routes
+Boltx
 
-Examples:
-- /api/login
-- /api/v1/user
-- /admin/dashboard
-- /auth/token
+---
+## License
 
+This project is for educational use only.
 
 
