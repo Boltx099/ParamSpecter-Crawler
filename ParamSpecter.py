@@ -1824,7 +1824,11 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
-          python ParamSpecter.py https://example.com --mode crawl
+          
+          NOTES: { **Always use --ignore-robots for cwaling** }
+          
+          python  ParamSpecter.py https://example.com/ --ignore-robots --mode crawl 
+          
           python ParamSpecter.py https://example.com --mode full -t 20 -d 5
           python ParamSpecter.py https://example.com --mode subdomain
           python ParamSpecter.py https://example.com --mode subdomain --sub-wordlist /path/to/subs.txt
