@@ -1825,7 +1825,7 @@ def main():
         epilog=textwrap.dedent("""
         Examples:
           
-          NOTES: { **Always use --ignore-robots for cwaling** }
+          NOTES: { **Always use --ignore-robots for crawling** }
           
           python  ParamSpecter.py https://example.com/ --ignore-robots --mode crawl 
           
