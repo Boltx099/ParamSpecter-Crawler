@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ParamSpecterPro v3.0 — Top-Notch Recon Crawler
+ParamSpecter v3.0 — Top-Notch Recon Crawler
 Advanced Web Crawler for Security Research & Bug Bounty
 For authorized and educational use ONLY.
 
@@ -24,6 +24,7 @@ Architecture:
 
 import requests, re, sys, json, csv, time, os, argparse
 import threading, queue, hashlib, random, signal, textwrap
+import socket, dns.resolver
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode, quote
 from urllib.robotparser import RobotFileParser
@@ -62,21 +63,15 @@ def status_color(code):
 
 BANNER = f"""
 {C.RED}{C.BOLD}
- ██████╗  █████╗ ██████╗  █████╗ ███╗   ███╗
- ██╔══██╗██╔══██╗██╔══██╗██╔══██╗████╗ ████║
- ██████╔╝███████║██████╔╝███████║██╔████╔██║
- ██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║╚██╔╝██║
- ██║     ██║  ██║██║  ██║██║  ██║██║ ╚═╝ ██║
- ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝
-{C.CYAN}  ███████╗██████╗ ███████╗ ██████╗████████╗███████╗██████╗
-  ██╔════╝██╔══██╗██╔════╝██╔════╝╚══██╔══╝██╔════╝██╔══██╗
-  ███████╗██████╔╝█████╗  ██║        ██║   █████╗  ██████╔╝
-  ╚════██║██╔═══╝ ██╔══╝  ██║        ██║   ██╔══╝  ██╔══██╗
-  ███████║██║     ███████╗╚██████╗   ██║   ███████╗██║  ██║
-  ╚══════╝╚═╝     ╚══════╝ ╚═════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝{C.RESET}
-{C.GRAY}  ParamSpecterPro v3.0 — Advanced Recon Crawler | Security Edition
-{C.BOLD}{C.MAGENTA}  Upgraded by Claude | For authorized testing only{C.RESET}
-{C.RED}{'─'*60}{C.RESET}
+  ██████╗  █████╗ ██████╗  █████╗ ███╗   ███╗███████╗██████╗ ███████╗ ██████╗████████╗███████╗██████╗
+  ██╔══██╗██╔══██╗██╔══██╗██╔══██╗████╗ ████║██╔════╝██╔══██╗██╔════╝██╔════╝╚══██╔══╝██╔════╝██╔══██╗
+  ██████╔╝███████║██████╔╝███████║██╔████╔██║█████╗  ██████╔╝█████╗  ██║        ██║   █████╗  ██████╔╝
+  ██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║╚██╔╝██║██╔══╝  ██╔══██╗██╔══╝  ██║        ██║   ██╔══╝  ██╔══██╗
+  ██║     ██║  ██║██║  ██║██║  ██║██║ ╚═╝ ██║███████╗██║  ██║███████╗╚██████╗   ██║   ███████╗██║  ██║
+  ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+{C.RESET}{C.GRAY}  ParamSpecter v3.0 - Advanced Recon Crawler | Security Edition
+{C.BOLD}{C.CYAN}  Created by Boltx  |  Upgraded by Claude{C.RESET}
+{C.RED}{'─'*90}{C.RESET}
 """
 
 # ─────────────────────────────────────────────────────────────
@@ -167,6 +162,28 @@ BUILTIN_PARAMS = [
 BUILTIN_EXTENSIONS = ["", ".php", ".html", ".asp", ".aspx", ".jsp",
                       ".json", ".xml", ".txt", ".bak", ".old", ".config",
                       ".yml", ".yaml", ".env"]
+
+BUILTIN_SUBDOMAINS = [
+    "www","mail","ftp","smtp","pop","imap","webmail","remote","vpn","ssh",
+    "dev","development","staging","test","testing","uat","qa","sandbox","demo",
+    "api","api2","v1","v2","rest","graphql","ws","websocket","socket",
+    "admin","administrator","panel","dashboard","portal","manage","manager",
+    "app","apps","web","backend","frontend","static","assets","cdn","media",
+    "img","images","files","upload","uploads","download","downloads","store",
+    "shop","blog","forum","wiki","docs","support","help","status","monitor",
+    "metrics","grafana","kibana","prometheus","jenkins","ci","gitlab","git",
+    "jira","confluence","redmine","sonar","nexus","artifactory","registry",
+    "db","database","mysql","postgres","mongo","redis","elastic","search",
+    "internal","intranet","private","corp","office","employees","staff",
+    "vpn","proxy","gateway","router","firewall","lb","loadbalancer",
+    "auth","login","sso","oauth","id","identity","account","accounts",
+    "old","legacy","backup","archive","temp","tmp","new","beta","alpha",
+    "mobile","m","ios","android","wap",
+    "ns","ns1","ns2","dns","dns1","dns2","mx","mx1","mx2",
+    "autodiscover","autoconfig","cpanel","whm","pleplesk","ftp2",
+]
+
+
 
 # ─────────────────────────────────────────────────────────────
 #  DETECTION PATTERNS
@@ -266,15 +283,15 @@ def log(prefix, msg, pcolor=C.WHITE, bullet=""):
 def log_section(title):
     with _log_lock:
         print(f"\n{col('─'*60, C.RED)}")
-        print(f"  {col('▶  ' + title, C.BOLD+C.CYAN)}")
+        print(f"  {col('>> ' + title, C.BOLD+C.CYAN)}")
         print(col('─'*60, C.RED))
 
 def log_finding(kind, detail, severity="INFO"):
     color_map = {"CRITICAL": C.RED+C.BOLD, "HIGH": C.RED, "MEDIUM": C.YELLOW,
                  "LOW": C.CYAN, "INFO": C.GRAY}
-    icon_map = {"CRITICAL": "🚨", "HIGH": "⚠️ ", "MEDIUM": "⚡", "LOW": "ℹ️ ", "INFO": "·"}
+    icon_map = {"CRITICAL": "[!!]", "HIGH": "[!] ", "MEDIUM": "[*]", "LOW": "[i] ", "INFO": "-"}
     pcolor = color_map.get(severity, C.GRAY)
-    icon = icon_map.get(severity, "·")
+    icon = icon_map.get(severity, "-")
     log(f"  {icon} {col(kind, pcolor)}", detail, C.WHITE)
 
 # ─────────────────────────────────────────────────────────────
@@ -325,7 +342,6 @@ def fetch_with_retry(session, url, method="GET", data=None, max_retries=3,
                 headers=headers,
                 timeout=timeout,
                 proxies=proxies,
-                allow_redirects=True,
                 **kwargs
             )
             return resp, None
@@ -872,7 +888,7 @@ class ParamFuzzer:
                         if code != self._base_code: reasons.append(f"status:{code}")
                         if diff > 100: reasons.append(f"Δsize:{diff}B")
                         if reflected: reasons.append("REFLECTED!")
-                        flag = col("★ INTERESTING " + " ".join(reasons), C.GREEN+C.BOLD)
+                        flag = col("* INTERESTING " + " ".join(reasons), C.GREEN+C.BOLD)
                         log(f"PARAM {pct:>3}%",
                             f"{status_color(code)}  "
                             f"{col('?'+param+'='+fuzz_val[:20], C.YELLOW)}  {flag}", C.CYAN)
@@ -894,7 +910,7 @@ class ParamFuzzer:
 # ─────────────────────────────────────────────────────────────
 #  MAIN CRAWLER
 # ─────────────────────────────────────────────────────────────
-class ParamSpecterPro:
+class ParamSpecter:
     def __init__(self, args):
         self.args           = args
         self.start_url      = args.url.rstrip("/")
@@ -1084,7 +1100,7 @@ class ParamSpecterPro:
 
                 if pd.get("interesting"):
                     for item in pd["interesting"][:3]:
-                        print(f"  {ts()}  {col('  ⚡ FIND', C.RED+C.BOLD)}  {col(item, C.YELLOW)}")
+                        print(f"  {ts()}  {col('  [*] FIND', C.RED+C.BOLD)}  {col(item, C.YELLOW)}")
                 if pd["emails"]:
                     print(f"  {ts()}  {col('     +', C.GREEN)}  Emails: {col(', '.join(pd['emails']), C.GREEN)}")
                 if pd["waf"]:
@@ -1098,7 +1114,7 @@ class ParamSpecterPro:
                 if pd["js_secrets"]:
                     print(f"  {ts()}  {col('     !', C.RED+C.BOLD)}  Secrets: {len(pd['js_secrets'])} possible secret(s)")
                 if pd["captcha_detected"]:
-                    print(f"  {ts()}  {col('    🔒', C.MAGENTA)}  CAPTCHA detected")
+                    print(f"  {ts()}  {col('    [C]', C.MAGENTA)}  CAPTCHA detected")
 
             # Aggregate
             with self.results_lock:
@@ -1249,7 +1265,7 @@ class ParamSpecterPro:
 
         # Secrets
         if self.all_secrets:
-            print(f"\n  {col('⚠️  Possible Secrets Found:', C.RED+C.BOLD)}")
+            print(f"\n  {col('[!]  Possible Secrets Found:', C.RED+C.BOLD)}")
             seen_vals = set()
             for s in self.all_secrets:
                 key = s.get("value","")[:30]
@@ -1260,7 +1276,7 @@ class ParamSpecterPro:
 
         # Interesting findings
         if self.all_interesting:
-            print(f"\n  {col('⚡ Interesting Findings:', C.MAGENTA)}")
+            print(f"\n  {col('[*] Interesting Findings:', C.MAGENTA)}")
             seen = set()
             for item in self.all_interesting:
                 if item not in seen:
@@ -1382,15 +1398,15 @@ class ParamSpecterPro:
 def main():
     print(BANNER)
     p = argparse.ArgumentParser(
-        description="ParamSpecterPro v3.0 — Advanced Recon Crawler",
+        description="ParamSpecter v3.0 — Advanced Recon Crawler",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
-          python ParamSpecterPro.py https://example.com --mode crawl
-          python ParamSpecterPro.py https://example.com --mode full -t 20 -d 5
-          python ParamSpecterPro.py https://example.com --mode fuzz -w /path/to/wordlist.txt -x .php,.html
-          python ParamSpecterPro.py https://example.com --mode param --smart-fuzz
-          python ParamSpecterPro.py https://example.com --strategy dfs --rotate-ua --proxies http://127.0.0.1:8080
+          python ParamSpecter.py https://example.com --mode crawl
+          python ParamSpecter.py https://example.com --mode full -t 20 -d 5
+          python ParamSpecter.py https://example.com --mode fuzz -w /path/to/wordlist.txt -x .php,.html
+          python ParamSpecter.py https://example.com --mode param --smart-fuzz
+          python ParamSpecter.py https://example.com --strategy dfs --rotate-ua --proxies http://127.0.0.1:8080
         """)
     )
 
@@ -1453,7 +1469,7 @@ def main():
         print(f"  {col('Smart Fuzz:', C.CYAN)} ON (multi-payload mode)")
     print(f"\n{col('='*60, C.RED)}\n")
 
-    ParamSpecterPro(args).run()
+    ParamSpecter(args).run()
 
 if __name__ == "__main__":
     main()
