@@ -72,7 +72,7 @@ BANNER = f"""
   ██║     ██║  ██║██║  ██║██║  ██║██║ ╚═╝ ██║███████╗██║  ██║███████╗╚██████╗   ██║   ███████╗██║  ██║
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
 {C.RESET}{C.GRAY}  ParamSpecter v4.0 -- Advanced Recon Crawler | Security Edition
-{C.BOLD}{C.CYAN}  Created by Boltx  |  v4.0 Enhanced by Claude{C.RESET}
+{C.BOLD}{C.CYAN}  Created by Boltx  
 {C.RED}{'─'*90}{C.RESET}
 """
 
