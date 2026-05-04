@@ -14,38 +14,37 @@ ParamSpecter is an advanced reconnaissance web crawler designed for bug bounty h
 
 ---
 
+
 ## What's New in v3.0 (vs v2.0)
 
 | Feature | v2.0 | v3.0 |
 |---|---|---|
-| Crawl strategies | BFS only | **BFS / DFS / Priority queue** |
-| Retry system | None | **Exponential backoff (configurable)** |
-| User-Agent | Single fixed | **Pool of 9 + per-request rotation** |
-| Content dedup | URL only | **URL + content hash (SHA-256)** |
-| Proxy support | None | **Proxy rotation with round-robin** |
-| Secret patterns | 3 | **10+ (AWS, GitHub, OpenAI, JWTs, DBs...)** |
-| JS analysis | Basic endpoints | **Endpoints + secrets + sourcemaps + config vars** |
-| Param fuzzing payloads | 1 | **6 (normal + SQLi + XSS + SSRF + SSTI + path traversal)** |
-| Technology detection | 14 techs | **22 techs (Next.js, Nuxt, FastAPI, Spring, GraphQL...)** |
-| WAF detection | 6 WAFs | **10 WAFs (AWS WAF, Imperva, F5...)** |
-| Cookie analysis | None | **Flags: HttpOnly / Secure / SameSite** |
-| Internal IP leak | None | **RFC-1918 range detection** |
-| Sitemap integration | None | **Auto-enqueue from robots.txt Sitemap:** |
-| Captcha detection | None | **hCaptcha / reCAPTCHA / Turnstile / Arkose** |
-| Header leak detection | None | **X-Powered-By, Server, X-Backend-Server...** |
-| SIGINT handling | Hard stop | **Graceful drain of active requests** |
-| Output | JSON + CSV | **JSON + CSV + JSONL + Secrets CSV** |
-| Security header check | 4 headers | **7 headers tracked** |
-| Max pages default | 50 | **100** |
-| Max crawl depth | 3 | **4** |
+| Crawl strategies | BFS only | BFS / DFS / Priority queue |
+| Retry system | None | Exponential backoff (configurable) |
+| User-Agent | Single fixed | Pool of 9 + per-request rotation |
+| Content dedup | URL only | URL + content hash (SHA-256) |
+| Proxy support | None | Proxy rotation with round-robin |
+| Secret patterns | 3 | 10+ (AWS, GitHub, OpenAI, JWTs, DBs) |
+| JS analysis | Basic endpoints | Endpoints + secrets + sourcemaps + config vars |
+| Param fuzzing payloads | 1 | 6 (normal + SQLi + XSS + SSRF + SSTI + path traversal) |
+| Technology detection | 14 techs | 22 techs (Next.js, Nuxt, FastAPI, Spring, GraphQL) |
+| WAF detection | 6 WAFs | 10 WAFs (AWS WAF, Imperva, F5) |
+| Cookie analysis | None | Flags: HttpOnly / Secure / SameSite |
+| Internal IP leak | None | RFC-1918 range detection |
+| Sitemap integration | None | Auto-enqueue from robots.txt Sitemap |
+| Captcha detection | None | hCaptcha / reCAPTCHA / Turnstile / Arkose |
+| Header leak detection | None | X-Powered-By, Server, X-Backend-Server |
+| SIGINT handling | Hard stop | Graceful drain of active requests |
+| Output | JSON + CSV | JSON + CSV + JSONL + Secrets CSV |
+| Security header check | 4 headers | 7 headers tracked |
+| Max pages default | 50 | 100 |
+| Max crawl depth | 3 | 4 |
 
 ---
 
 ## Installation
 
 ```bash
-git clone <repo>
-cd ParamSpecterPro
 pip install -r requirements.txt
 ```
 
@@ -55,39 +54,38 @@ pip install -r requirements.txt
 
 ```bash
 # Basic crawl
-python ParamSpecterPro.py https://example.com
+python ParamSpecter.py https://example.com --ignore-robots
 
 # Full recon (crawl + dir fuzz + param fuzz)
-python ParamSpecterPro.py https://example.com --mode full
+python ParamSpecter.py https://example.com --mode full --ignore-robots
 
 # Deep crawl with UA rotation and proxy
-python ParamSpecterPro.py https://example.com \
-  --mode crawl \
+python ParamSpecter.py https://example.com \
+  --ignore-robots \
   --depth 5 \
   --threads 20 \
   --rotate-ua \
   --proxies http://127.0.0.1:8080
 
 # Directory bruteforce with custom wordlist
-python ParamSpecterPro.py https://example.com \
+python ParamSpecter.py https://example.com \
   --mode fuzz \
-  -w /path/to/SecLists/Discovery/Web-Content/common.txt \
+  -w /path/to/wordlist.txt \
   -x .php,.html,.bak \
   --match-codes 200,301,403
 
-# Parameter discovery + smart fuzzing (multi-payload)
-python ParamSpecterPro.py https://example.com/search \
+# Parameter discovery with smart fuzzing (SQLi, XSS, SSRF)
+python ParamSpecter.py https://example.com/search \
   --mode param \
-  --smart-fuzz \
-  --param-method GET
+  --smart-fuzz
 
 # DFS crawl (goes deep before wide)
-python ParamSpecterPro.py https://example.com \
+python ParamSpecter.py https://example.com \
   --strategy dfs \
   --depth 6
 
-# With session cookies + custom headers
-python ParamSpecterPro.py https://example.com \
+# With session cookies and custom headers
+python ParamSpecter.py https://example.com \
   --cookies "session=abc123; auth=xyz" \
   --headers "X-API-Key: mykey" "Authorization: Bearer token123"
 ```
@@ -98,7 +96,7 @@ python ParamSpecterPro.py https://example.com \
 
 ```
 positional:
-  url                   Target URL
+  url                   Target URL  e.g. https://example.com
 
 mode:
   --mode                crawl | fuzz | param | full  (default: crawl)
@@ -114,7 +112,7 @@ crawl options:
   --follow-external     Follow links to other domains
   --ignore-robots       Ignore robots.txt restrictions
 
-identity & evasion:
+identity and evasion:
   -u, --user-agent      Set a custom User-Agent string
   --rotate-ua           Rotate UA from pool on each request
   --cookies             Cookie string: "a=1; b=2"
@@ -128,7 +126,7 @@ fuzzing:
   --match-codes         Only show these HTTP codes: 200,301,403
   --hide-codes          Hide these HTTP codes (default: 404)
   --param-method        GET | POST (default: GET)
-  --smart-fuzz          Test 6 payloads per param (SQLi, XSS, SSRF...)
+  --smart-fuzz          Test 6 payloads per param (SQLi, XSS, SSRF)
 
 output:
   -o, --output          json | csv | both | jsonl (default: both)
@@ -140,18 +138,18 @@ output:
 
 | File | Contents |
 |---|---|
-| `paramspecter_<domain>_<ts>.json` | Full crawl data (all pages, meta, secrets) |
-| `paramspecter_<domain>_<ts>.csv`  | Per-page flat CSV |
-| `paramspecter_<domain>_<ts>_fuzz.csv` | Directory fuzz hits |
-| `paramspecter_<domain>_<ts>_params.csv` | Interesting parameter hits |
-| `paramspecter_<domain>_<ts>_secrets.csv` | Extracted secrets |
+| paramspecter_domain_ts.json | Full crawl data (pages, meta, secrets) |
+| paramspecter_domain_ts.csv | Per-page flat CSV |
+| paramspecter_domain_ts_fuzz.csv | Directory fuzz hits |
+| paramspecter_domain_ts_params.csv | Interesting parameter hits |
+| paramspecter_domain_ts_secrets.csv | Extracted secrets |
 
 ---
 
 ## Architecture
 
 ```
-ParamSpecterPro
+ParamSpecter
 ├── CrawlQueue          BFS / DFS / Priority queue
 ├── RobotsTxtHandler    robots.txt + sitemap extraction
 ├── JSAnalyzer          JS endpoint + secret + sourcemap analysis
@@ -159,28 +157,7 @@ ParamSpecterPro
 ├── DirFuzzer           Multi-threaded directory bruteforce
 ├── ParamFuzzer         Multi-payload parameter discovery
 ├── ProxyManager        Round-robin proxy rotation
-└── ParamSpecterPro     Main orchestrator + stats + output
-```
-
----
-
-## Scaling for Distributed Crawling
-
-For large-scale distributed crawling, consider:
-
-1. **Queue**: Replace `CrawlQueue` with Redis-backed queue (`rq`, `celery`)
-2. **State**: Move `visited` set to Redis `SET` for shared dedup
-3. **Workers**: Run multiple instances pointing at the same Redis queue
-4. **Storage**: Write results to MongoDB / PostgreSQL instead of flat files
-5. **Orchestration**: Use Kubernetes Jobs or AWS Fargate for worker scaling
-
-Example Redis-backed URL queue swap:
-```python
-import redis
-r = redis.Redis()
-r.sadd("visited", url)        # shared dedup
-r.lpush("queue", url)         # task queue
-url = r.brpop("queue", timeout=3)
+└── ParamSpecter        Main orchestrator + stats + output
 ```
 
 ---
@@ -189,13 +166,32 @@ url = r.brpop("queue", timeout=3)
 
 | Feature | Description |
 |---|---|
-| **JS source analysis** | Extracts API endpoints, secrets, config vars, sourcemaps |
-| **Secret detection** | 10+ patterns: AWS keys, GitHub PATs, JWTs, DB strings, OpenAI keys |
-| **Parameter reflection** | Detects reflected params (XSS surface) |
-| **Smart fuzzing** | Tests SQLi, XSS, SSRF, SSTI, path traversal payloads |
-| **Cookie flags** | Flags cookies missing HttpOnly/Secure/SameSite |
-| **WAF fingerprinting** | Identifies 10 common WAF products |
-| **Internal IP detection** | Flags RFC-1918 addresses leaking in responses |
-| **Security header audit** | Tracks 7 security headers across all pages |
-| **CAPTCHA detection** | Detects reCAPTCHA, hCaptcha, Turnstile, Arkose |
-| **Technology fingerprinting** | Identifies 22 frameworks, servers, CDNs |
+| JS source analysis | Extracts API endpoints, secrets, config vars, sourcemaps |
+| Secret detection | 10+ patterns: AWS keys, GitHub PATs, JWTs, DB strings, OpenAI keys |
+| Parameter reflection | Detects reflected params (XSS surface) |
+| Smart fuzzing | Tests SQLi, XSS, SSRF, SSTI, path traversal payloads |
+| Cookie flags | Flags cookies missing HttpOnly/Secure/SameSite |
+| WAF fingerprinting | Identifies 10 common WAF products |
+| Internal IP detection | Flags RFC-1918 addresses leaking in responses |
+| Security header audit | Tracks 7 security headers across all pages |
+| CAPTCHA detection | Detects reCAPTCHA, hCaptcha, Turnstile, Arkose |
+| Technology fingerprinting | Identifies 22 frameworks, servers, CDNs |
+
+---
+
+## Scaling for Distributed Crawling
+
+1. Replace CrawlQueue with Redis-backed queue (rq, celery)
+2. Move visited set to Redis SET for shared deduplication
+3. Run multiple instances pointing at the same Redis queue
+4. Write results to MongoDB or PostgreSQL instead of flat files
+5. Use Kubernetes Jobs or AWS Fargate for worker scaling
+
+Redis example:
+```python
+import redis
+r = redis.Redis()
+r.sadd("visited", url)
+r.lpush("queue", url)
+url = r.brpop("queue", timeout=3)
+```
