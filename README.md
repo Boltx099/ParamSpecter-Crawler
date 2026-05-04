@@ -114,6 +114,53 @@ README.md            Documentation
 - Integration with tools like ffuf and nuclei  
 
 ---
+
+# Wordlist Features
+
+## Directory Fuzzer (--mode fuzz or --mode full):
+
+- With your own wordlist
+```
+python ParamSpecter.py https://example.com --mode fuzz -w /path/to/dirs.txt
+```
+-With extensions (like gobuster)
+```
+python ParamSpecter.py https://example.com --mode fuzz -w wordlist.txt -x .php,.html,.bak
+```
+
+- Only show 200 and 403
+```
+python ParamSpecter.py https://example.com --mode fuzz --match-codes 200,403
+```
+
+- Hide 404 and 500 (custom)
+```
+python ParamSpecter.py https://example.com --mode fuzz --hide-codes 404,500
+
+```
+---
+
+## Parameter Fuzzer (--mode param):
+
+
+- Discover hidden GET params
+  
+```
+python ParamSpecter.py https://example.com/search --mode param -pw params.txt
+```
+- Fuzz via POST instead
+
+```
+python ParamSpecter.py https://example.com/api --mode param --param-method POST
+
+```
+---
+## Full scan (crawl → fuzz → param all at once):
+
+```
+python ParamSpecter.py https://example.com --mode full -w dirs.txt -pw params.txt -x .php,.bak -t 20
+
+```
 ## Author
 
 Boltx
