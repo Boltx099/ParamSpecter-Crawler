@@ -1,6 +1,18 @@
-# ParamSpecter Dependencies
-
+# ParamSpecterPro v3.0 Requirements
+# Core (required)
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+lxml>=4.9.0          # faster HTML parser
 
+# Optional but recommended
+fake-useragent>=1.4.0   # extended UA pool (pip install fake-useragent)
+tqdm>=4.66.0             # progress bars
+colorama>=0.4.6          # Windows color support
 
+# For JS rendering (optional, headless browser)
+# playwright>=1.40.0     # pip install playwright && playwright install chromium
+# pyppeteer>=1.0.2       # alternative headless
+
+# For DB storage (optional)
+# pymongo>=4.6.0         # MongoDB
+# psycopg2-binary>=2.9.9 # PostgreSQL
