@@ -3601,7 +3601,7 @@ Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
 def main():
     print(BANNER)
     p = argparse.ArgumentParser(
-        description="ParamSpecter v4.3 -- Advanced Recon Crawler",
+        description="ParamSpecter v5.0 -- Advanced Recon Crawler",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
