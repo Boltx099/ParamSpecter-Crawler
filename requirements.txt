@@ -1,8 +1,13 @@
-# ParamSpecter v3.0 Requirements
+# ParamSpecter v4.3 Requirements
+
 # Core (required)
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0          # faster HTML parser
+
+# DNS resolution -- used by SubdomainHunter for brute-force + record analysis
+# Falls back to socket.gethostbyname() if missing, but performance is degraded
+dnspython>=2.4.0
 
 # Optional but recommended
 fake-useragent>=1.4.0   # extended UA pool (pip install fake-useragent)
