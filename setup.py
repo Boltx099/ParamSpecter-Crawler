@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="paramspecter",
-    version="4.3",
+    version="5.0",
     description="Advanced Recon Crawler for Bug Bounty and Security Research",
     author="Boltx",
     py_modules=["ParamSpecter"],
