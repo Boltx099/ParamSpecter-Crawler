@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ParamSpecter v4.0 -- Advanced Recon Crawler
+ParamSpecter v4.2 -- Advanced Recon Crawler
 Advanced Web Crawler for Security Research & Bug Bounty
 For authorized and educational use ONLY.
 
@@ -19,7 +19,7 @@ New in v4.0:
 """
 
 import requests, re, sys, json, csv, time, os, argparse
-import threading, queue, hashlib, random, signal, textwrap, socket
+import threading, queue, hashlib, random, signal, textwrap, socket, statistics, tempfile
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode, quote
 from urllib.robotparser import RobotFileParser
@@ -71,7 +71,7 @@ BANNER = f"""
   ██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║╚██╔╝██║██╔══╝  ██╔══██╗██╔══╝  ██║        ██║   ██╔══╝  ██╔══██╗
   ██║     ██║  ██║██║  ██║██║  ██║██║ ╚═╝ ██║███████╗██║  ██║███████╗╚██████╗   ██║   ███████╗██║  ██║
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
-{C.RESET}{C.GRAY}  ParamSpecter v4.0 -- Advanced Recon Crawler | Security Edition
+{C.RESET}{C.GRAY}  ParamSpecter v4.3 -- Advanced Recon Crawler | Security Edition
 {C.BOLD}{C.CYAN}  Created by Boltx  
 {C.RED}{'─'*90}{C.RESET}
 """
@@ -376,8 +376,26 @@ def is_same_domain(url: str, base_domain: str) -> bool:
         return False
 
 
+# Patterns that vary per-request but don't indicate unique content
+_VOLATILE_PATTERNS = [
+    # CSRF tokens inside HTML attribute context only
+    re.compile(r"csrfmiddlewaretoken\b[^>]{0,80}value=[\"'][^\"']{10,64}[\"']", re.I),
+    re.compile(r"name=[\"'](?:_token|authenticity_token|csrf_token)[\"'][^>]*value=[\"'][^\"']{10,}[\"']", re.I),
+    # Nonce/XSRF tokens in assignment context (after = or :)
+    re.compile(r"(?<=[=:\"])(?:nonce|_csrf|xsrf)[^\"\s&]{16,}", re.I),
+    # Millisecond unix timestamps only (exactly 13 digits, not part of larger number)
+    re.compile(r"(?<!\d)\d{13}(?!\d)"),
+    # Long hex hashes only inside attribute value context (after = or opening quote)
+    # This avoids stripping visible Git SHAs in page body text
+    re.compile(r"(?<=[=\"'])([0-9a-f]{40,64})(?=[\"'\s&]|$)", re.I),
+]
+
 def content_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    """Hash page content after stripping volatile dynamic tokens for stable dedup."""
+    stripped = text
+    for pat in _VOLATILE_PATTERNS:
+        stripped = pat.sub("", stripped)
+    return hashlib.sha256(stripped.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 def random_ua() -> str:
@@ -412,19 +430,25 @@ def fetch_with_retry(session, url, method="GET", data=None, max_retries=3,
                 method, url, data=data, headers=headers,
                 timeout=timeout, proxies=proxies, **kwargs
             )
+            # 429 Too Many Requests -- honour Retry-After before retrying
+            if resp.status_code == 429 and attempt < max_retries:
+                retry_after = float(resp.headers.get("Retry-After", delay * 2))
+                retry_after = min(retry_after, 60)
+                time.sleep(retry_after)
+                continue
             return resp, None
         except requests.exceptions.ConnectionError as e:
             err = f"ConnectionError: {e}"
         except requests.exceptions.Timeout:
             err = "Timeout"
         except requests.exceptions.TooManyRedirects:
-            err = "TooManyRedirects"
+            return None, "TooManyRedirects"
         except Exception as e:
             err = str(e)
         if attempt < max_retries:
             jitter = random.uniform(0, 0.3) * delay
             time.sleep(delay + jitter)
-            delay = min(delay * 2, 16)
+            delay = min(delay * 2, 30)
     return None, err
 
 
@@ -491,49 +515,92 @@ class JSAnalyzer:
     INTERESTING_VARS = re.compile(
         r"""(?:const|let|var)\s+(\w+)\s*=\s*['"`]([^'"`\n]{6,})['"`]""", re.I
     )
+    # Dynamic import patterns: import("./chunk"), require.ensure(["./mod"]),
+    # webpack publicPath + chunk filenames from __webpack_require__
+    DYNAMIC_IMPORT_PATTERNS = [
+        re.compile(r'import\s*\(\s*["\x27]([^"\x27]+\.js[^"\x27]*)["\x27]\s*\)', re.I),
+        re.compile(r'require\.ensure\s*\(\s*\[([^\]]+)\]', re.I),
+        re.compile(r'chunkFilename\s*:\s*["\x27]([^"\x27]+)["\x27]', re.I),
+        re.compile(r'__webpack_require__\.p\s*\+\s*["\x27]([^"\x27]+\.js)["\x27]', re.I),
+        re.compile(r'["\x27]([/.][\w./-]+\.chunk\.js)["\x27]', re.I),
+    ]
 
     def __init__(self, session, rotate_ua=False):
         self.session = session
         self.rotate_ua = rotate_ua
 
-    def analyze(self, js_src_list: List[str], page_url: str):
+    def analyze(self, js_src_list: List[str], page_url: str,
+                inline_scripts: List[str] = None):
         endpoints: Set[str] = set()
         secrets: List[Dict] = []
         sourcemaps: List[str] = []
 
-        for js_url in js_src_list:
+        # Analyze inline <script> blocks first (no HTTP request needed)
+        for inline_text in (inline_scripts or []):
+            self._scan_js(inline_text, page_url, endpoints, secrets, sourcemaps)
+
+        # Track which JS files we have already fetched to avoid loops
+        fetched_js: Set[str] = set()
+        # Queue of JS URLs to fetch (seeded from explicit src= list)
+        js_queue: List[str] = list(js_src_list)
+
+        while js_queue:
+            js_url = js_queue.pop(0)
             full_url = urljoin(page_url, js_url)
+            # Normalise to avoid re-fetching the same file via different relative paths
+            norm = full_url.split("?")[0].split("#")[0]
+            if norm in fetched_js:
+                continue
+            fetched_js.add(norm)
+
             resp, err = fetch_with_retry(self.session, full_url, timeout=8,
                                          rotate_ua=self.rotate_ua)
             if not resp or resp.status_code != 200:
                 continue
 
             text = resp.text
+            self._scan_js(text, full_url, endpoints, secrets, sourcemaps)
 
-            for m in self.EP_PATTERN.finditer(text):
-                ep = m.group(1).split("?")[0]
-                if 1 < len(ep) < 200:
-                    endpoints.add(ep)
-
-            for pat, label in SECRET_PATTERNS:
+            # Discover additional JS chunks referenced dynamically
+            for pat in self.DYNAMIC_IMPORT_PATTERNS:
                 for m in pat.finditer(text):
-                    val = m.group(1) if m.lastindex else m.group(0)
-                    if len(val) > 6:
-                        secrets.append({"type": label, "value": val[:80], "source": full_url})
-
-            for m in self.INTERESTING_VARS.finditer(text):
-                vname, vval = m.group(1), m.group(2)
-                if any(kw in vname.lower() for kw in
-                       ["url", "host", "endpoint", "base", "api", "key", "secret", "token"]):
-                    secrets.append({"type": f"JS var: {vname}", "value": vval[:80], "source": full_url})
-
-            for m in PATTERNS["sourcemap"].finditer(text):
-                sourcemaps.append(urljoin(full_url, m.group(1)))
-
-            for m in PATTERNS["jwt"].finditer(text):
-                secrets.append({"type": "JWT token", "value": m.group(0)[:80], "source": full_url})
+                    chunk_path = m.group(1)
+                    # Skip data URIs and absolute external URLs
+                    if chunk_path.startswith("data:") or (
+                        chunk_path.startswith("http") and
+                        urlparse(chunk_path).netloc != urlparse(page_url).netloc
+                    ):
+                        continue
+                    chunk_norm = urljoin(full_url, chunk_path).split("?")[0]
+                    if chunk_norm not in fetched_js:
+                        js_queue.append(chunk_path)
 
         return list(endpoints), secrets, sourcemaps
+
+    def _scan_js(self, text: str, source_url: str,
+                 endpoints: set, secrets: list, sourcemaps: list):
+        for m in self.EP_PATTERN.finditer(text):
+            ep = m.group(1).split("?")[0]
+            if 1 < len(ep) < 200:
+                endpoints.add(ep)
+
+        for pat, label in SECRET_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                if len(val) > 6:
+                    secrets.append({"type": label, "value": val[:80], "source": source_url})
+
+        for m in self.INTERESTING_VARS.finditer(text):
+            vname, vval = m.group(1), m.group(2)
+            if any(kw in vname.lower() for kw in
+                   ["url", "host", "endpoint", "base", "api", "key", "secret", "token"]):
+                secrets.append({"type": f"JS var: {vname}", "value": vval[:80], "source": source_url})
+
+        for m in PATTERNS["sourcemap"].finditer(text):
+            sourcemaps.append(urljoin(source_url, m.group(1)))
+
+        for m in PATTERNS["jwt"].finditer(text):
+            secrets.append({"type": "JWT token", "value": m.group(0)[:80], "source": source_url})
 
 
 # -----------------------------------------------------------------
@@ -634,7 +701,7 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
 
     # Internal paths
     data["internal_paths"] = list(set(re.findall(
-        r'(?:src|href|action|data-url|data-src)=["\']([ ^"\'<>]{2,})["\']', raw_html
+        r'(?:src|href|action|data-url|data-src)=["\']([^"\'<>]{2,})["\']', raw_html
     )))
 
     # Forms
@@ -678,8 +745,16 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
         if sig.search(waf_text):
             data["waf"].append(waf_name)
 
-    # JS analysis
-    ep, sec, sm = js_analyzer.analyze(data["js_src"], url)
+    # Extract inline <script> block content for analysis
+    inline_scripts: List[str] = []
+    if soup:
+        for tag in soup.find_all("script", src=False):
+            txt = tag.get_text()
+            if txt and len(txt.strip()) > 20:
+                inline_scripts.append(txt)
+
+    # JS analysis -- covers both external src files and inline blocks
+    ep, sec, sm = js_analyzer.analyze(data["js_src"], url, inline_scripts)
     data["js_endpoints"] = sorted(ep)
     data["js_secrets"]   = sec
     data["sourcemaps"]   = sm
@@ -732,10 +807,11 @@ class CrawlQueue:
             self._q.put(item)
 
     def get(self, timeout=3):
+        # BUG FIX: always call get() once; unwrap priority tuple afterwards
+        raw = self._q.get(timeout=timeout)
         if self.strategy == "priority":
-            _, item = self._q.get(timeout=timeout)
-            return item
-        return self._q.get(timeout=timeout)
+            return raw[1]
+        return raw
 
     def task_done(self):
         self._q.task_done()
@@ -745,6 +821,45 @@ class CrawlQueue:
 
     def qsize(self):
         return self._q.qsize()
+
+
+# -----------------------------------------------------------------
+#  TOKEN BUCKET RATE LIMITER (per-host)
+# -----------------------------------------------------------------
+class TokenBucket:
+    """
+    Classic token-bucket rate limiter.
+    Allows `rate` tokens per second with a burst capacity of `capacity`.
+    Thread-safe. Used to enforce per-host request rates.
+    """
+    def __init__(self, rate: float, capacity: float = None):
+        self.rate     = rate              # tokens added per second
+        self.capacity = capacity or rate  # max burst
+        self._tokens  = self.capacity
+        self._last    = time.monotonic()
+        self._lock    = threading.Lock()
+
+    def acquire(self, timeout: float = 30.0) -> bool:
+        """Block until a token is available or timeout expires. Returns True on success."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last
+                self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return True
+            wait = min(1.0 / max(self.rate, 0.001), deadline - time.monotonic())
+            if wait <= 0:
+                return False
+            time.sleep(wait)
+
+
+# Maximum number of per-host buckets to keep in memory.
+# Hosts beyond this limit share the oldest evicted bucket (LRU-ish).
+_HOST_BUCKET_LIMIT = 512
 
 
 # -----------------------------------------------------------------
@@ -803,13 +918,15 @@ class SubdomainHunter:
     CRTSH_URL = "https://crt.sh/?q=%25.{domain}&output=json"
 
     def __init__(self, domain: str, wordlist: List[str], threads: int,
-                 timeout: int, session, results_out: List[Dict]):
+                 timeout: int, session, results_out: List[Dict],
+                 stop_event: threading.Event = None):
         self.domain      = domain.lstrip("*.").lower()
         self.wordlist    = wordlist
         self.threads     = threads
         self.timeout     = timeout
         self.session     = session
         self.results_out = results_out
+        self.stop_event  = stop_event or threading.Event()
         self._found: Dict[str, Dict] = {}
         self._lock = threading.Lock()
 
@@ -826,26 +943,30 @@ class SubdomainHunter:
             return None
 
     def _brute_worker(self, q: queue.Queue, total: int, done_counter: List[int]):
-        while True:
+        while not self.stop_event.is_set():
             try:
-                word = q.get(timeout=2)
+                word = q.get(timeout=1)
             except queue.Empty:
                 break
-            fqdn = f"{word}.{self.domain}"
-            ips = self._resolve(fqdn)
-            with self._lock:
-                done_counter[0] += 1
-                pct = int(done_counter[0] / total * 100)
-            if ips:
-                entry = {"subdomain": fqdn, "ips": ips, "method": "brute-force", "status": None}
+            try:
+                fqdn = f"{word}.{self.domain}"
+                ips = self._resolve(fqdn)
                 with self._lock:
-                    if fqdn not in self._found:
-                        self._found[fqdn] = entry
-                        log(f"SUB {pct:>3}%",
-                            f"{col('[+]', C.GREEN+C.BOLD)}  {col(fqdn, C.CYAN)}  "
-                            f"{col('->', C.GRAY)}  {col(', '.join(ips), C.GREEN)}",
-                            C.GREEN)
-            q.task_done()
+                    done_counter[0] += 1
+                    pct = int(done_counter[0] / total * 100)
+                if ips:
+                    entry = {"subdomain": fqdn, "ips": ips, "method": "brute-force", "status": None}
+                    with self._lock:
+                        if fqdn not in self._found:
+                            self._found[fqdn] = entry
+                            log(f"SUB {pct:>3}%",
+                                f"{col('[+]', C.GREEN+C.BOLD)}  {col(fqdn, C.CYAN)}  "
+                                f"{col('->', C.GRAY)}  {col(', '.join(ips), C.GREEN)}",
+                                C.GREEN)
+            except Exception as e:
+                log("SUB", col(f"Worker error: {e}", C.RED), C.RED)
+            finally:
+                q.task_done()
 
     def _run_brute(self):
         log_section("SUBDOMAIN BRUTE-FORCE")
@@ -950,13 +1071,28 @@ class SubdomainHunter:
                         C.CYAN)
                     break
 
-        workers = []
+        # Cap probe threads -- spawning one thread per subdomain is unsafe at scale
+        probe_threads = min(50, len(items))
+        probe_q: queue.Queue = queue.Queue()
         for entry in items:
-            t = threading.Thread(target=probe, args=(entry,), daemon=True)
-            workers.append(t)
-            t.start()
-        for t in workers:
-            t.join(timeout=self.timeout + 2)
+            probe_q.put(entry)
+
+        def _probe_worker():
+            while not self.stop_event.is_set():
+                try:
+                    entry = probe_q.get(timeout=1)
+                except queue.Empty:
+                    break
+                try:
+                    probe(entry)
+                finally:
+                    probe_q.task_done()
+
+        workers = [threading.Thread(target=_probe_worker, daemon=True)
+                   for _ in range(probe_threads)]
+        for w in workers:
+            w.start()
+        probe_q.join()
 
     def run(self) -> List[Dict]:
         self._run_brute()
@@ -995,8 +1131,8 @@ class DirectoryHunter:
     def __init__(self, base_url: str, wordlist: List[str], extensions: List[str],
                  threads: int, timeout: int, session, delay: float,
                  match_codes: Optional[Set[int]], hide_codes: Set[int],
-                 hits_out: List[Dict], rotate_ua: bool = False,
-                 proxy_mgr=None, max_retries: int = 2,
+                 hits_out: List[Dict], stop_event: threading.Event = None,
+                 rotate_ua: bool = False, proxy_mgr=None, max_retries: int = 2,
                  recursive: bool = False, max_depth: int = 2):
         self.base_url    = base_url.rstrip("/")
         self.wordlist    = wordlist
@@ -1008,6 +1144,7 @@ class DirectoryHunter:
         self.match_codes = match_codes
         self.hide_codes  = hide_codes
         self.hits_out    = hits_out
+        self.stop_event  = stop_event or threading.Event()
         self.rotate_ua   = rotate_ua
         self.proxy_mgr   = proxy_mgr
         self.max_retries = max_retries
@@ -1020,45 +1157,58 @@ class DirectoryHunter:
 
         # For soft-404/wildcard detection
         self._baseline_len: int = 0
+        self._baseline_stdev: int = 0
         self._wildcard: bool = False
 
     # -- Baseline / wildcard --
     def _detect_wildcard(self):
         """
-        Request two random non-existent paths.
-        If both return non-404 with similar size, assume wildcard responses.
+        Send 5 random non-existent path probes.
+        If at least 4 return non-404, we have a wildcard/catch-all.
+        Use mean + 2*stdev as the threshold so natural size variation
+        does not cause false-positive filtering.
         """
-        rand1 = f"{self.base_url}/paramspecter_random_9x7z_{random.randint(10000,99999)}"
-        rand2 = f"{self.base_url}/paramspecter_random_2q8w_{random.randint(10000,99999)}"
+        prefixes = ["ps_wc1", "ps_wc2", "ps_wc3", "ps_wc4", "ps_wc5"]
         sizes = []
-        for url in (rand1, rand2):
-            resp, _ = fetch_with_retry(self.session, url, timeout=self.timeout,
+        for pfx in prefixes:
+            probe = f"{self.base_url}/{pfx}_{random.randint(10000,99999)}_notexist"
+            resp, _ = fetch_with_retry(self.session, probe, timeout=self.timeout,
                                        rotate_ua=self.rotate_ua, max_retries=1,
                                        allow_redirects=False)
             if resp and resp.status_code not in (404, 400, 410):
                 sizes.append(len(resp.content))
-        if len(sizes) == 2:
+
+        if len(sizes) >= 4:
             self._wildcard = True
-            # Use average size as baseline to detect wildcard matches
-            self._baseline_len = sum(sizes) // 2
+            self._baseline_len = int(statistics.mean(sizes))
+            # stdev threshold: responses within mean +/- 2*stdev are wildcard
+            self._baseline_stdev = int(statistics.stdev(sizes)) if len(sizes) > 1 else 50
             log("DIR", col(
-                f"Wildcard/catch-all detected (baseline ~{self._baseline_len}B) -- using size filter",
+                f"Wildcard detected ({len(sizes)}/5 probes hit) "
+                f"baseline={self._baseline_len}B stdev={self._baseline_stdev}B",
                 C.YELLOW), C.YELLOW)
         else:
             self._wildcard = False
+            self._baseline_stdev = 0
 
     def _is_wildcard_response(self, size: int) -> bool:
         if not self._wildcard or self._baseline_len == 0:
             return False
-        # If size is within 5% of baseline, treat as wildcard
-        diff = abs(size - self._baseline_len)
-        return diff < max(50, int(self._baseline_len * 0.05))
+        # If stdev is 0 (all responses identical, or fired simultaneously),
+        # use 3% of the baseline size as the threshold but at least 32B.
+        # This is tighter than the old flat 100B floor and avoids false
+        # positives on small catch-all pages (e.g. a 50B "not found" JSON).
+        if self._baseline_stdev == 0:
+            threshold = max(32, int(self._baseline_len * 0.03))
+        else:
+            threshold = max(32, self._baseline_stdev * 2)
+        return abs(size - self._baseline_len) < threshold
 
     # -- Worker --
     def _worker(self, q: queue.Queue, total: int, done_ctr: List[int]):
-        while True:
+        while not self.stop_event.is_set():
             try:
-                url = q.get(timeout=2)
+                url = q.get(timeout=1)
             except queue.Empty:
                 break
             try:
@@ -1076,21 +1226,17 @@ class DirectoryHunter:
                     code = resp.status_code
                     sz = len(resp.content)
 
-                    # Skip if wildcard match
                     if self._is_wildcard_response(sz):
                         q.task_done()
                         time.sleep(self.delay)
                         continue
 
-                    # Apply filters
                     show = True
                     if self.match_codes and code not in self.match_codes:
                         show = False
                     if code in self.hide_codes:
                         show = False
 
-                    # Size-based dedup: skip if we already have a hit with identical size
-                    # at the same base path (catches parameterised catch-alls)
                     if show:
                         with self._lock:
                             if url in self._seen_urls:
@@ -1109,14 +1255,14 @@ class DirectoryHunter:
                         with self._lock:
                             self._hits.append(hit)
                             self.hits_out.append(hit)
-            except Exception:
-                pass
+            except Exception as e:
+                log("DIR", col(f"Worker error: {e}", C.RED), C.RED)
             finally:
                 time.sleep(self.delay)
                 q.task_done()
 
     def _enumerate(self, base: str, depth: int = 0):
-        if depth > self.max_depth:
+        if depth > self.max_depth or self.stop_event.is_set():
             return
 
         log("DIR", f"Enumerating {col(base, C.CYAN)} (depth {depth})", C.CYAN)
@@ -1142,7 +1288,7 @@ class DirectoryHunter:
         q.join()
 
         # Recursive: go into discovered directories
-        if self.recursive and depth < self.max_depth:
+        if self.recursive and depth < self.max_depth and not self.stop_event.is_set():
             with self._lock:
                 new_dirs = [
                     h["url"] for h in self._hits
@@ -1159,7 +1305,10 @@ class DirectoryHunter:
                    f"Extensions: {col(self.extensions, C.BOLD)}  "
                    f"Recursive: {col(self.recursive, C.BOLD)}", C.CYAN)
         self._enumerate(self.base_url)
-        log("DIR", f"Done -- {col(len(self._hits), C.BOLD+C.GREEN)} hits found", C.GREEN)
+        if self.stop_event.is_set():
+            log("DIR", col("Directory hunt stopped by user", C.YELLOW), C.YELLOW)
+        else:
+            log("DIR", f"Done -- {col(len(self._hits), C.BOLD+C.GREEN)} hits found", C.GREEN)
         return self._hits
 
 
@@ -1177,8 +1326,8 @@ class ParamFuzzer:
     ]
 
     def __init__(self, target_url, param_list, threads, timeout, session,
-                 delay, hits_out, method="GET", rotate_ua=False,
-                 proxy_mgr=None, smart_fuzz=False):
+                 delay, hits_out, stop_event: threading.Event = None,
+                 method="GET", rotate_ua=False, proxy_mgr=None, smart_fuzz=False):
         self.target_url = target_url
         self.param_list = param_list
         self.threads    = threads
@@ -1186,6 +1335,7 @@ class ParamFuzzer:
         self.session    = session
         self.delay      = delay
         self.hits_out   = hits_out
+        self.stop_event = stop_event or threading.Event()
         self.method     = method.upper()
         self.rotate_ua  = rotate_ua
         self.proxy_mgr  = proxy_mgr
@@ -1221,13 +1371,16 @@ class ParamFuzzer:
         for w in workers:
             w.start()
         self._q.join()
-        log("PARAM", f"Done -- {col(len(self._hits), C.BOLD+C.GREEN)} interesting params found", C.GREEN)
+        if self.stop_event.is_set():
+            log("PARAM", col("Parameter fuzz stopped by user", C.YELLOW), C.YELLOW)
+        else:
+            log("PARAM", f"Done -- {col(len(self._hits), C.BOLD+C.GREEN)} interesting params found", C.GREEN)
         return self._hits
 
     def _worker(self, total: int):
-        while True:
+        while not self.stop_event.is_set():
             try:
-                param, fuzz_val = self._q.get(timeout=2)
+                param, fuzz_val = self._q.get(timeout=1)
             except queue.Empty:
                 break
             try:
@@ -1280,8 +1433,8 @@ class ParamFuzzer:
                         with self._lock:
                             self._hits.append(hit)
                             self.hits_out.append(hit)
-            except Exception:
-                pass
+            except Exception as e:
+                log("PARAM", col(f"Worker error: {e}", C.RED), C.RED)
             finally:
                 time.sleep(self.delay)
                 self._q.task_done()
@@ -1369,6 +1522,8 @@ class ParamSpecter:
 
         # Stats
         self.stats = CrawlStats()
+
+        # Shared stop event -- all phases and workers check this
         self._stop_event = threading.Event()
 
         # Robots
@@ -1388,14 +1543,45 @@ class ParamSpecter:
                 self.delay = self.robots.crawl_delay
                 log("ROBOTS", f"Honoring crawl-delay: {self.delay}s", C.YELLOW)
 
+        # Per-host token-bucket rate limiters (bounded dict to prevent memory leak)
+        # Rate = threads * 0.8 req/s per host by default, configurable later.
+        self._host_rate = max(1.0, self.threads * 0.8)
+        self._host_buckets: Dict[str, TokenBucket] = {}
+        self._host_buckets_lock = threading.Lock()
+
         # JS Analyzer
         self.js_analyzer = JSAnalyzer(self.session, rotate_ua=self.rotate_ua)
 
         signal.signal(signal.SIGINT, self._handle_sigint)
         self.start_time = datetime.now()
 
+    def _host_bucket(self, url: str) -> TokenBucket:
+        """
+        Return a per-host TokenBucket, creating one if needed.
+        The dict is bounded to _HOST_BUCKET_LIMIT entries; when full,
+        the first-inserted key is evicted (dict insertion order, Python 3.7+).
+        """
+        host = urlparse(url).netloc
+        with self._host_buckets_lock:
+            if host not in self._host_buckets:
+                if len(self._host_buckets) >= _HOST_BUCKET_LIMIT:
+                    # Evict the oldest entry (first key in insertion order)
+                    evict_key = next(iter(self._host_buckets))
+                    del self._host_buckets[evict_key]
+                self._host_buckets[host] = TokenBucket(
+                    rate=self._host_rate,
+                    capacity=self._host_rate * 2  # allow small bursts
+                )
+            return self._host_buckets[host]
+
     def _handle_sigint(self, sig, frame):
-        log("STOP", col("CTRL+C received -- finishing active requests...", C.YELLOW), C.RED)
+        if self._stop_event.is_set():
+            log("STOP", col("Force exit.", C.RED), C.RED)
+            sys.exit(1)
+        with _log_lock:
+            print(f"\n{col('─' * 65, C.YELLOW)}")
+            print(f"  {col('>> SCAN INTERRUPTED -- saving partial results...', C.BOLD + C.YELLOW)}")
+            print(col('─' * 65, C.YELLOW))
         self._stop_event.set()
 
     # ---- crawl worker ----
@@ -1416,8 +1602,6 @@ class ParamSpecter:
                 if self.stats.pages_crawled >= self.max_pages:
                     self.crawl_queue.task_done()
                     break
-                self.stats.pages_crawled += 1
-                count = self.stats.pages_crawled
 
             if self.robots and not self.robots.allowed(url):
                 log("SKIP", col(url, C.GRAY), C.GRAY)
@@ -1425,17 +1609,20 @@ class ParamSpecter:
                 continue
 
             proxies = self.proxy_mgr.next() if self.proxy_mgr else None
+            bucket = self._host_bucket(url)
+            bucket.acquire()  # rate-limit per host before firing request
             resp, err = fetch_with_retry(
-                self.session, url, timeout=self.timeout,
-                rotate_ua=self.rotate_ua, proxies=proxies,
-                max_retries=self.max_retries, allow_redirects=True
-            )
+                    self.session, url, timeout=self.timeout,
+                    rotate_ua=self.rotate_ua, proxies=proxies,
+                    max_retries=self.max_retries, allow_redirects=True
+                )
 
             if resp is None:
-                log(f"[{count:>4}]", f"{col('FAIL', C.RED)}  {col(url, C.GRAY)}  ({err})", C.RED)
                 with self.results_lock:
                     self.results.append({"url": url, "status": None, "error": err})
                     self.stats.pages_failed += 1
+                    count = self.stats.pages_crawled
+                log(f"[{count:>4}]", f"{col('FAIL', C.RED)}  {col(url, C.GRAY)}  ({err})", C.RED)
                 self.crawl_queue.task_done()
                 time.sleep(self.delay)
                 continue
@@ -1458,7 +1645,7 @@ class ParamSpecter:
             chash = content_hash(raw)
             with self.visited_lock:
                 if chash in self.visited_hashes and len(raw) > 200:
-                    log(f"[{count:>4}]", f"{col('DUPE', C.GRAY)}  {col(url, C.GRAY)}", C.GRAY)
+                    log("DUPE", col(url, C.GRAY), C.GRAY)
                     self.crawl_queue.task_done()
                     time.sleep(self.delay)
                     continue
@@ -1466,11 +1653,17 @@ class ParamSpecter:
 
             pd = analyze_page(url, resp, soup, raw, self.js_analyzer)
 
-            # Print result
+            # BUG FIX: increment pages_crawled AFTER successful fetch (accurate count)
+            with self.results_lock:
+                self.stats.pages_crawled += 1
+                count = self.stats.pages_crawled
+
             redir_info = f"  -> {resp.url}" if resp.history else ""
+            q_depth = self.crawl_queue.qsize()
             with _log_lock:
                 print(f"  {ts()}  {col(f'[{count:>4}]', C.CYAN)}  {status_color(resp.status_code)}  "
-                      f"{col(url[:75], C.WHITE)}{col(redir_info, C.YELLOW)}")
+                      f"{col(url[:72], C.WHITE)}{col(redir_info, C.YELLOW)}"
+                      f"  {col(f'[q:{q_depth}]', C.GRAY)}")
                 if pd.get("interesting"):
                     for item in pd["interesting"][:3]:
                         print(f"  {ts()}  {col('  [*] FIND', C.RED+C.BOLD)}  {col(item, C.YELLOW)}")
@@ -1499,7 +1692,16 @@ class ParamSpecter:
                 self.all_techs.update(pd["technologies"])
                 self.all_wafs.update(pd["waf"])
                 self.all_params.update(pd["params"])
-                self.all_secrets.extend(pd["js_secrets"])
+                # Deduplicate secrets by (type, value prefix) -- keep first occurrence
+                _seen_secret_keys = {
+                    (s.get("type",""), s.get("value","")[:40])
+                    for s in self.all_secrets
+                }
+                for s in pd["js_secrets"]:
+                    key = (s.get("type",""), s.get("value","")[:40])
+                    if key not in _seen_secret_keys:
+                        _seen_secret_keys.add(key)
+                        self.all_secrets.append(s)
                 self.all_forms += len(pd["forms"])
                 self.all_interesting.extend(pd["interesting"])
                 self.stats.emails_found  = len(self.all_emails)
@@ -1512,8 +1714,10 @@ class ParamSpecter:
                         self.missing_sec_headers[sh] += 1
 
             # Enqueue new links
-            if depth < self.depth and ("html" in mime or mime in CRAWLABLE_MIME):
+            if depth < self.depth and not self._stop_event.is_set()                     and ("html" in mime or mime in CRAWLABLE_MIME):
                 for link in pd["links"]:
+                    if self._stop_event.is_set():
+                        break
                     with self.visited_lock:
                         if link not in self.visited:
                             if not self.same_domain or is_same_domain(link, self.base_domain):
@@ -1524,13 +1728,47 @@ class ParamSpecter:
             self.crawl_queue.task_done()
 
     def run_crawl(self):
-        workers = [threading.Thread(target=self._crawl_worker, daemon=True)
+        # _workers_done is set once all worker threads have exited naturally.
+        # Using a Barrier of size (threads + 1) so main thread participates:
+        # each worker calls barrier.wait() on exit; main calls barrier.wait()
+        # to block until all workers are done.  This is race-free: there is no
+        # window between "queue empty" and "task_done called".
+        _barrier = threading.Barrier(self.threads + 1, timeout=3600)
+
+        def _worker_wrapper():
+            try:
+                self._crawl_worker()
+            finally:
+                try:
+                    _barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+
+        workers = [threading.Thread(target=_worker_wrapper, daemon=True)
                    for _ in range(self.threads)]
         for w in workers:
             w.start()
-        self.crawl_queue.join()
+
+        try:
+            _barrier.wait()  # blocks until all workers have called wait()
+        except threading.BrokenBarrierError:
+            pass
+
+        # On Ctrl+C drain the queue so task_done counts stay balanced
+        if self._stop_event.is_set():
+            drained = 0
+            while True:
+                try:
+                    self.crawl_queue._q.get_nowait()
+                    self.crawl_queue._q.task_done()
+                    drained += 1
+                except queue.Empty:
+                    break
+            if drained:
+                log("STOP", f"Drained {drained} pending URLs from queue", C.YELLOW)
+
         for w in workers:
-            w.join(timeout=1)
+            w.join(timeout=3)
 
     # ---- directory hunt ----
     def run_dir_hunt(self, base_url=None):
@@ -1545,7 +1783,7 @@ class ParamSpecter:
         DirectoryHunter(
             base_url or self.start_url, wl, exts,
             a.threads, a.timeout, self.session, a.delay,
-            mc, hc, self.dir_hits,
+            mc, hc, self.dir_hits, self._stop_event,
             rotate_ua=self.rotate_ua, proxy_mgr=self.proxy_mgr,
             recursive=recursive, max_depth=max_rdepth,
         ).run()
@@ -1557,7 +1795,8 @@ class ParamSpecter:
         ParamFuzzer(
             target_url or self.start_url, pl,
             a.threads, a.timeout, self.session, a.delay,
-            self.param_hits, getattr(a, "param_method", "GET"),
+            self.param_hits, self._stop_event,
+            getattr(a, "param_method", "GET"),
             rotate_ua=self.rotate_ua, proxy_mgr=self.proxy_mgr,
             smart_fuzz=self.smart_fuzz,
         ).run()
@@ -1572,6 +1811,7 @@ class ParamSpecter:
         SubdomainHunter(
             root_domain, wl, a.threads,
             a.timeout, self.session, self.subdomain_hits,
+            self._stop_event,
         ).run()
 
     # ---- orchestrate ----
@@ -1582,12 +1822,12 @@ class ParamSpecter:
             log_section("PHASE 1 -- CRAWLING")
             self.run_crawl()
 
-        if mode in ("subdomain", "full"):
+        if not self._stop_event.is_set() and mode in ("subdomain", "full"):
             log_section("PHASE 2 -- SUBDOMAIN ENUMERATION")
             self.run_subdomain_hunt()
             self.stats.subdomains_found = len(self.subdomain_hits)
 
-        if mode in ("fuzz", "full"):
+        if not self._stop_event.is_set() and mode in ("fuzz", "full"):
             log_section("PHASE 3 -- DIRECTORY HUNTING")
             targets = {self.start_url}
             if mode == "full" and self.results:
@@ -1595,10 +1835,12 @@ class ParamSpecter:
                     p = urlparse(r.get("url", "")).path.rsplit("/", 1)[0]
                     targets.add(self.start_url.rstrip("/") + (p or ""))
             for t in list(targets)[:5]:
+                if self._stop_event.is_set():
+                    break
                 self.run_dir_hunt(base_url=t)
             self.stats.dir_hits = len(self.dir_hits)
 
-        if mode in ("param", "full"):
+        if not self._stop_event.is_set() and mode in ("param", "full"):
             log_section("PHASE 4 -- PARAMETER FUZZING")
             targets = [self.start_url]
             if mode == "full":
@@ -1607,6 +1849,8 @@ class ParamSpecter:
                 if param_urls:
                     targets = param_urls[:10]
             for t in targets:
+                if self._stop_event.is_set():
+                    break
                 self.run_param_fuzz(target_url=t)
 
         self.print_summary()
@@ -1615,9 +1859,10 @@ class ParamSpecter:
     # ---- summary ----
     def print_summary(self):
         dur = self.stats.elapsed()
-        print(f"\n{col('='*60, C.RED)}")
-        print(col("  SCAN COMPLETE", C.BOLD+C.WHITE))
-        print(col("="*60, C.RED))
+        interrupted = "  (INTERRUPTED)" if self._stop_event.is_set() else ""
+        print(f"\n{col('='*65, C.RED)}")
+        print(col(f"  SCAN COMPLETE{interrupted}", C.BOLD+C.WHITE))
+        print(col("="*65, C.RED))
 
         rows = [
             ("Target",           self.start_url),
@@ -1710,7 +1955,7 @@ class ParamSpecter:
             for h, c in sorted(self.missing_sec_headers.items(), key=lambda x: -x[1]):
                 print(f"    {col(h, C.RED)}: {c} page(s)")
 
-        print(f"{col('='*60, C.RED)}\n")
+        print(f"{col('='*65, C.RED)}\n")
 
     # ---- save ----
     def save_results(self):
@@ -1721,6 +1966,7 @@ class ParamSpecter:
             "target": self.start_url, "mode": self.mode, "strategy": self.strategy,
             "crawled_at": self.start_time.isoformat(),
             "duration": self.stats.elapsed(),
+            "interrupted": self._stop_event.is_set(),
             "total_pages": self.stats.pages_crawled,
             "emails": list(self.all_emails),
             "phones": list(self.all_phones),
@@ -1735,16 +1981,27 @@ class ParamSpecter:
 
         if self.output in ("json", "both", "jsonl"):
             fname = f"{pfx}.json"
-            with open(fname, "w", encoding="utf-8") as f:
-                json.dump({
-                    "meta": meta,
-                    "pages": self.results,
-                    "secrets": self.all_secrets,
-                    "fuzz_hits": self.fuzz_hits,
-                    "dir_hits": self.dir_hits,
-                    "param_hits": self.param_hits,
-                    "subdomain_hits": self.subdomain_hits,
-                }, f, indent=2, ensure_ascii=False)
+            payload = {
+                "meta": meta,
+                "pages": self.results,
+                "secrets": self.all_secrets,
+                "fuzz_hits": self.fuzz_hits,
+                "dir_hits": self.dir_hits,
+                "param_hits": self.param_hits,
+                "subdomain_hits": self.subdomain_hits,
+            }
+            # Atomic write: write to temp file then rename so a Ctrl+C mid-write
+            # never leaves a truncated/corrupt output file
+            try:
+                fd, tmp_path = tempfile.mkstemp(suffix=".json.tmp",
+                                                dir=os.path.dirname(fname) or ".")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, fname)
+            except Exception as e:
+                log("SAVE", col(f"Atomic write failed ({e}), trying direct write", C.YELLOW), C.YELLOW)
+                with open(fname, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
             log("SAVED", f"JSON -> {col(fname, C.CYAN)}", C.GREEN)
 
             if self.output == "jsonl":
@@ -1761,7 +2018,9 @@ class ParamSpecter:
                       "redirect_chain","social_links","security_headers",
                       "leaked_headers","js_endpoints","sourcemaps","captcha_detected",
                       "content_length","content_hash"]
-            with open(fname, "w", newline="", encoding="utf-8") as f:
+            # Atomic: write to temp then rename
+            _tmp_csv = fname + ".tmp"
+            with open(_tmp_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
                 w.writeheader()
                 for r in self.results:
@@ -1775,43 +2034,61 @@ class ParamSpecter:
                     row["security_headers"] = str(r.get("security_headers", {}))
                     row["leaked_headers"]   = str(r.get("leaked_headers", {}))
                     w.writerow(row)
+            os.replace(_tmp_csv, fname)
             log("SAVED", f"CSV  -> {col(fname, C.CYAN)}", C.GREEN)
 
+            def _write_csv_atomic(path, fieldnames, rows, extra_fn=None):
+                """Write CSV atomically via temp file + rename."""
+                tmp = path + ".tmp"
+                try:
+                    with open(tmp, "w", newline="", encoding="utf-8") as f:
+                        wtr = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                        wtr.writeheader()
+                        if extra_fn:
+                            for row in rows:
+                                wtr.writerow(extra_fn(dict(row)))
+                        else:
+                            wtr.writerows(rows)
+                    os.replace(tmp, path)
+                    log("SAVED", f"CSV  -> {col(path, C.CYAN)}", C.GREEN)
+                except Exception as e:
+                    log("SAVE", col(f"Failed writing {path}: {e}", C.RED), C.RED)
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+
             if self.dir_hits:
-                df = f"{pfx}_dirs.csv"
-                with open(df, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=["url","status","size","redirect"])
-                    w.writeheader()
-                    w.writerows(self.dir_hits)
-                log("SAVED", f"CSV  -> {col(df, C.CYAN)}", C.GREEN)
+                _write_csv_atomic(
+                    f"{pfx}_dirs.csv",
+                    ["url","status","size","redirect"],
+                    self.dir_hits
+                )
 
             if self.param_hits:
-                pf = f"{pfx}_params.csv"
-                with open(pf, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=["param","payload","url","status","size","size_diff","reflected"])
-                    w.writeheader()
-                    w.writerows(self.param_hits)
-                log("SAVED", f"CSV  -> {col(pf, C.CYAN)}", C.GREEN)
+                _write_csv_atomic(
+                    f"{pfx}_params.csv",
+                    ["param","payload","url","status","size","size_diff","reflected"],
+                    self.param_hits
+                )
 
             if self.all_secrets:
-                sf = f"{pfx}_secrets.csv"
-                with open(sf, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=["type","value","source"])
-                    w.writeheader()
-                    w.writerows(self.all_secrets)
-                log("SAVED", f"CSV  -> {col(sf, C.CYAN)}", C.GREEN)
+                _write_csv_atomic(
+                    f"{pfx}_secrets.csv",
+                    ["type","value","source"],
+                    self.all_secrets
+                )
 
             if self.subdomain_hits:
-                subf = f"{pfx}_subdomains.csv"
-                with open(subf, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=["subdomain","ips","method","status","http_url","title"],
-                                       extrasaction="ignore")
-                    w.writeheader()
-                    for h in self.subdomain_hits:
-                        row = dict(h)
-                        row["ips"] = ", ".join(h.get("ips", []))
-                        w.writerow(row)
-                log("SAVED", f"CSV  -> {col(subf, C.CYAN)}", C.GREEN)
+                def _fix_sub(row):
+                    row["ips"] = ", ".join(row.get("ips", []) if isinstance(row.get("ips"), list) else [row.get("ips","")])
+                    return row
+                _write_csv_atomic(
+                    f"{pfx}_subdomains.csv",
+                    ["subdomain","ips","method","status","http_url","title"],
+                    self.subdomain_hits,
+                    extra_fn=_fix_sub
+                )
 
 
 # -----------------------------------------------------------------
@@ -1820,21 +2097,36 @@ class ParamSpecter:
 def main():
     print(BANNER)
     p = argparse.ArgumentParser(
-        description="ParamSpecter v4.0 -- Advanced Recon Crawler",
+        description="ParamSpecter v4.3 -- Advanced Recon Crawler",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
-          
-          NOTES: { **Always use --ignore-robots for crawling** }
-          
-          python  ParamSpecter.py https://example.com/ --ignore-robots --mode crawl 
-          
-          python ParamSpecter.py https://example.com --mode full -t 20 -d 5
-          python ParamSpecter.py https://example.com --mode subdomain
-          python ParamSpecter.py https://example.com --mode subdomain --sub-wordlist /path/to/subs.txt
-          python ParamSpecter.py https://example.com --mode fuzz -w /path/to/wordlist.txt -x .php,.html --recursive
-          python ParamSpecter.py https://example.com --mode param --smart-fuzz
-          python ParamSpecter.py https://example.com --strategy dfs --rotate-ua --proxies http://127.0.0.1:8080
+
+          Basic crawl (bypass robots for full coverage):
+            python ParamSpecter.py https://example.com --ignore-robots
+
+          Subdomain enumeration:
+            python ParamSpecter.py https://example.com --mode subdomain
+            python ParamSpecter.py https://example.com --mode subdomain --sub-wordlist subs.txt
+
+          Directory hunting (recursive, with extensions):
+            python ParamSpecter.py https://example.com --mode fuzz --recursive
+            python ParamSpecter.py https://example.com --mode fuzz -w dirs.txt -x .php,.html,.bak --recursive-depth 3
+
+          Parameter fuzzing (smart = 6 payloads per param):
+            python ParamSpecter.py https://example.com/search --mode param --smart-fuzz
+
+          Full recon in one shot:
+            python ParamSpecter.py https://example.com --mode full -t 20 --ignore-robots
+
+          Deep crawl with UA rotation and Burp proxy:
+            python ParamSpecter.py https://example.com --depth 6 -t 15 --rotate-ua --proxies http://127.0.0.1:8080
+
+          Authenticated crawl with session cookie:
+            python ParamSpecter.py https://example.com --cookies "session=abc123; auth=xyz" --headers "X-API-Key: key"
+
+          Ctrl+C once = graceful stop + save partial results
+          Ctrl+C twice = force quit immediately
         """)
     )
 
@@ -1891,25 +2183,61 @@ def main():
 
     args = p.parse_args()
 
-    # Print config
-    print(f"  {col('WARNING:', C.RED+C.BOLD)} Only test targets you own or have written authorisation to test.\n")
-    print(f"  {col('Target        :', C.CYAN)} {args.url}")
-    print(f"  {col('Mode          :', C.CYAN)} {args.mode}")
-    print(f"  {col('Strategy      :', C.CYAN)} {args.strategy}")
-    print(f"  {col('Threads       :', C.CYAN)} {args.threads}")
-    print(f"  {col('Depth         :', C.CYAN)} {args.depth}")
-    print(f"  {col('Delay         :', C.CYAN)} {args.delay}s")
-    print(f"  {col('Max Pages     :', C.CYAN)} {args.max_pages}")
-    print(f"  {col('Max Retry     :', C.CYAN)} {args.max_retries}")
-    print(f"  {col('Rotate UA     :', C.CYAN)} {args.rotate_ua}")
-    print(f"  {col('Recursive Dir :', C.CYAN)} {args.recursive} (depth {args.recursive_depth})")
+    # Startup config table -- clean aligned layout
+    def _yn(v): return col("yes", C.GREEN) if v else col("no", C.GRAY)
+    W = 20
+    sep = col("─" * 60, C.GRAY)
+
+    print(f"  {col('WARNING:', C.RED+C.BOLD)} Only test targets you have explicit written authorisation to test.\n")
+    print(sep)
+    print(f"  {col('TARGET', C.BOLD+C.WHITE)}")
+    print(f"  {'URL':<{W}} {col(args.url, C.CYAN)}")
+    print(f"  {'Mode':<{W}} {col(args.mode, C.YELLOW)}")
+    print(f"  {'Output format':<{W}} {col(args.output, C.WHITE)}")
+    print(sep)
+    print(f"  {col('CRAWL SETTINGS', C.BOLD+C.WHITE)}")
+    print(f"  {'Threads':<{W}} {col(args.threads, C.WHITE)}")
+    print(f"  {'Depth':<{W}} {col(args.depth, C.WHITE)}")
+    print(f"  {'Max pages':<{W}} {col(args.max_pages, C.WHITE)}")
+    print(f"  {'Delay':<{W}} {col(str(args.delay) + 's', C.WHITE)}")
+    print(f"  {'Timeout':<{W}} {col(str(args.timeout) + 's', C.WHITE)}")
+    print(f"  {'Max retries':<{W}} {col(args.max_retries, C.WHITE)}")
+    print(f"  {'Strategy':<{W}} {col(args.strategy, C.WHITE)}")
+    print(f"  {'Rotate UA':<{W}} {_yn(args.rotate_ua)}")
+    print(f"  {'Follow external':<{W}} {_yn(args.follow_external)}")
+    print(f"  {'Ignore robots':<{W}} {_yn(args.ignore_robots)}")
+    if args.mode in ("fuzz", "full"):
+        print(sep)
+        print(f"  {col('DIRECTORY HUNTING', C.BOLD+C.WHITE)}")
+        print(f"  {'Wordlist':<{W}} {args.wordlist or col('built-in', C.GRAY)}")
+        print(f"  {'Extensions':<{W}} {col(args.extensions or '(none)', C.WHITE)}")
+        print(f"  {'Recursive':<{W}} {_yn(args.recursive)}")
+        if args.recursive:
+            print(f"  {'Recurse depth':<{W}} {col(args.recursive_depth, C.WHITE)}")
+        print(f"  {'Match codes':<{W}} {col(args.match_codes or 'any', C.WHITE)}")
+        print(f"  {'Hide codes':<{W}} {col(args.hide_codes, C.WHITE)}")
+    if args.mode in ("param", "full"):
+        print(sep)
+        print(f"  {col('PARAMETER FUZZING', C.BOLD+C.WHITE)}")
+        print(f"  {'Wordlist':<{W}} {args.param_wordlist or col('built-in', C.GRAY)}")
+        print(f"  {'Method':<{W}} {col(args.param_method, C.WHITE)}")
+        print(f"  {'Smart fuzz':<{W}} {_yn(args.smart_fuzz)}")
+    if args.mode in ("subdomain", "full"):
+        print(sep)
+        print(f"  {col('SUBDOMAIN ENUM', C.BOLD+C.WHITE)}")
+        print(f"  {'Wordlist':<{W}} {args.sub_wordlist or col('built-in', C.GRAY)}")
     if args.proxies:
-        print(f"  {col('Proxies       :', C.CYAN)} {args.proxies}")
-    if args.smart_fuzz:
-        print(f"  {col('Smart Fuzz    :', C.CYAN)} ON (multi-payload mode)")
+        print(sep)
+        print(f"  {col('PROXY', C.BOLD+C.WHITE)}")
+        print(f"  {'Proxies':<{W}} {col(args.proxies, C.WHITE)}")
     if not DNS_AVAILABLE:
-        print(f"  {col('DNS lib       :', C.YELLOW)} dnspython not installed (pip install dnspython) -- using socket fallback")
-    print(f"\n{col('='*60, C.RED)}\n")
+        print(sep)
+        print(f"  {col('NOTE:', C.YELLOW+C.BOLD)} dnspython not installed -- socket fallback active.")
+        print(f"       Run: {col('pip install dnspython', C.CYAN)}")
+    print(sep)
+    print(f"  {col('Ctrl+C once = graceful stop (saves partial results)', C.GRAY)}")
+    print(f"  {col('Ctrl+C twice = force quit immediately', C.GRAY)}")
+    print(sep + "\n")
 
     ParamSpecter(args).run()
 
