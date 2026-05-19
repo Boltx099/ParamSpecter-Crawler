@@ -1,4 +1,4 @@
-# ParamSpecter v4.3 Requirements
+# ParamSpecter v5.0 Requirements
 
 # Core (required)
 requests>=2.31.0
