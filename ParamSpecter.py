@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ParamSpecter v4.2 -- Advanced Recon Crawler
+ParamSpecter v5.0 -- Advanced Recon Crawler
 Advanced Web Crawler for Security Research & Bug Bounty
 For authorized and educational use ONLY.
 
@@ -11,11 +11,15 @@ Modes:
   subdomain -- DNS brute-force + cert transparency subdomain enumeration
   full      -- All phases combined
 
-New in v4.0:
-  - SubdomainHunter  : DNS brute-force, crt.sh cert transparency, DNS record analysis
-  - DirectoryHunter  : Recursive dir enumeration, wildcard detection, size-based dedup
-  - Accuracy fixes   : canonical URL normalisation, fragment stripping, mime-type gating,
-                       redirect-chain dedup, anchor/mailto filtering, param dedup
+New in v5.0:
+  - Header Injection : Host header injection + CRLF injection checks
+  - IDOR Check       : Numeric ID parameter incrementation detection
+  - Scope file       : --scope-file for multi-domain/CIDR scoping
+  - Rate limit CLI   : --rate-limit flag (requests/sec per host)
+  - Resume support   : --resume / --resume-file for interrupted scans
+  - Output dir       : --output-dir flag for all saved files
+  - HTML report      : self-contained HTML summary report
+  - Custom payloads  : --payload-file for deep-fuzz custom payloads
 """
 
 import requests, re, sys, json, csv, time, os, argparse
@@ -77,7 +81,7 @@ BANNER = f"""
   ██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║╚██╔╝██║██╔══╝  ██╔══██╗██╔══╝  ██║        ██║   ██╔══╝  ██╔══██╗
   ██║     ██║  ██║██║  ██║██║  ██║██║ ╚═╝ ██║███████╗██║  ██║███████╗╚██████╗   ██║   ███████╗██║  ██║
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
-{C.RESET}{C.GRAY}  ParamSpecter v4.3 -- Advanced Recon Crawler | Security Edition
+{C.RESET}{C.GRAY}  ParamSpecter v5.0 -- Advanced Recon Crawler | Security Edition
 {C.BOLD}{C.CYAN}  Created by Boltx  
 {C.RED}{'─'*90}{C.RESET}
 """
@@ -1626,6 +1630,285 @@ class OpenRedirectCheck(DeepFuzzCheck):
         return False, ""
 
 
+class HeaderInjectionCheck(DeepFuzzCheck):
+    """
+    HTTP Header Injection — Host header injection and CRLF injection.
+
+    Host header injection: sends a spoofed Host header and checks if
+    the response body or Location header reflects it (password reset
+    poisoning, cache poisoning).
+
+    CRLF injection: injects CR+LF into a parameter value and checks
+    if the injected string appears as a new response header, which
+    indicates the server is echoing raw input into its header stream.
+    """
+    LABEL    = "HeaderInjection"
+    SEVERITY = "HIGH"
+
+    _CANARY_HOST = "evil.paramspecter.test"
+
+    PAYLOADS = [
+        # Host header injection canary
+        f"host_inject:{_CANARY_HOST}",
+        # CRLF via URL-encoded CR+LF
+        "crlf_inject:%0d%0aX-Injected-Header:paramspecter",
+        # CRLF via raw newline in value
+        "crlf_inject:\r\nX-Injected-Header:paramspecter",
+        # Double-encoded CRLF
+        "crlf_inject:%250d%250aX-Injected-Header:paramspecter",
+    ]
+
+    _CRLF_MARKER = "X-Injected-Header"
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        if not resp:
+            return False, ""
+
+        if payload.startswith("host_inject:"):
+            # Check if canary host appears in body or Location
+            body = resp.text
+            loc  = resp.headers.get("Location", "")
+            if self._CANARY_HOST in body:
+                idx = body.find(self._CANARY_HOST)
+                snippet = body[max(0, idx-20):idx+len(self._CANARY_HOST)+20].replace("\n", " ")
+                return True, f"Host header reflected in body: «{snippet[:120]}»"
+            if self._CANARY_HOST in loc:
+                return True, f"Host header reflected in Location: {loc[:120]}"
+
+        elif "crlf_inject:" in payload:
+            # Check for injected header appearing in response headers
+            if self._CRLF_MARKER in resp.headers:
+                return True, f"CRLF injection: '{self._CRLF_MARKER}' appeared in response headers"
+            # Also check body in case server echoes headers back
+            if self._CRLF_MARKER in resp.text:
+                return True, f"CRLF injection marker reflected in response body"
+
+        return False, ""
+
+    def send_custom(self, session, target_url: str, param: str,
+                    timeout: int, rotate_ua: bool, proxies) -> Tuple[bool, str]:
+        """
+        Override the normal param-value injection for Host header test:
+        sends the request with a spoofed Host header instead of
+        injecting into a query parameter.
+        """
+        headers = {"Host": self._CANARY_HOST}
+        if rotate_ua:
+            headers["User-Agent"] = random_ua()
+        try:
+            resp = session.get(target_url, headers=headers,
+                               timeout=timeout, proxies=proxies,
+                               allow_redirects=False)
+            triggered, evidence = self.detect(f"host_inject:{self._CANARY_HOST}", resp, 0)
+            return triggered, evidence
+        except Exception as e:
+            return False, str(e)
+
+
+class IDORCheck(DeepFuzzCheck):
+    """
+    Insecure Direct Object Reference (IDOR) — numeric ID probing.
+
+    For each parameter carrying a numeric value, sends requests with
+    id+1, id-1, id+100, and id=0.  Flags when:
+      - The response size differs significantly from the baseline
+        (different record returned)
+      - The response status differs (403 → 200 = access control bypass)
+      - Response body contains a different user/account identifier
+
+    Note: only fires on parameters whose baseline value is numeric.
+    Non-numeric params are skipped silently.
+    """
+    LABEL    = "IDOR"
+    SEVERITY = "HIGH"
+
+    # Placeholder; actual payloads are computed per-param from the numeric value
+    PAYLOADS = ["__idor_probe__"]
+
+    # Patterns that suggest a record was returned with different owner data
+    _OWNER_PATTERNS = re.compile(
+        r'"(?:user(?:name|_?id)?|email|account|owner|author)"'
+        r'\s*:\s*"([^"]{3,})"',
+        re.I,
+    )
+
+    def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
+        # Generic detect — real logic is in probe_idor(); this is a stub.
+        return False, ""
+
+    def probe_idor(self, session, target_url: str, param: str,
+                   baseline_val: str, baseline_size: int, baseline_code: int,
+                   timeout: int, rotate_ua: bool, proxies) -> List[Tuple[bool, str, str]]:
+        """
+        Returns list of (triggered, evidence, tested_value) tuples.
+        """
+        try:
+            base_int = int(baseline_val)
+        except (ValueError, TypeError):
+            return []  # not numeric — skip
+
+        findings = []
+        probes = [
+            base_int + 1,
+            base_int - 1,
+            base_int + 100,
+            0,
+        ]
+        for probe_val in probes:
+            if probe_val < 0:
+                continue
+            sep  = "&" if "?" in target_url else "?"
+            url  = f"{target_url}{sep}{param}={probe_val}"
+            hdrs = {"User-Agent": random_ua()} if rotate_ua else {}
+            try:
+                resp = session.get(url, headers=hdrs, timeout=timeout,
+                                   proxies=proxies, allow_redirects=True)
+                code = resp.status_code
+                size = len(resp.content)
+
+                # Status-code change (e.g., 403 → 200)
+                if code != baseline_code and code == 200:
+                    findings.append((
+                        True,
+                        f"Status changed {baseline_code}→{code} for id={probe_val}",
+                        str(probe_val),
+                    ))
+                    continue
+
+                # Significant size delta on a 200
+                if code == 200 and abs(size - baseline_size) > 200:
+                    # Check for different owner fields in JSON
+                    m = self._OWNER_PATTERNS.search(resp.text)
+                    evidence = (
+                        f"Different record returned for id={probe_val} "
+                        f"(size delta={abs(size-baseline_size)}B"
+                        + (f", owner field: {m.group(1)[:40]}" if m else "")
+                        + ")"
+                    )
+                    findings.append((True, evidence, str(probe_val)))
+
+            except Exception:
+                pass
+
+        return findings
+
+
+# -----------------------------------------------------------------
+#  CUSTOM PAYLOAD LOADER
+# -----------------------------------------------------------------
+def load_payload_file(path: Optional[str]) -> Dict[str, List[str]]:
+    """
+    Load a custom payload file for --deep-fuzz.
+
+    Format (one entry per line):
+        CHECK_LABEL:payload string
+
+    Example:
+        SQLi:' OR SLEEP(5)--
+        XSS:<img src=x onerror=alert(document.domain)>
+        PathTraversal:../../../../etc/shadow
+
+    Lines starting with # are comments.  Unknown labels are ignored
+    with a warning.  Returns a dict mapping label -> list of payloads.
+    """
+    if not path:
+        return {}
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        print(col(f"  [!] Payload file not found: {path}", C.RED))
+        sys.exit(1)
+
+    known_labels = {"SQLi", "XSS", "PathTraversal", "SSRF",
+                    "OpenRedirect", "HeaderInjection", "IDOR"}
+    result: Dict[str, List[str]] = defaultdict(list)
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                print(col(f"  [!] payload file line {lineno}: missing label prefix, skipped", C.YELLOW))
+                continue
+            label, payload = line.split(":", 1)
+            label = label.strip()
+            if label not in known_labels:
+                print(col(f"  [!] payload file line {lineno}: unknown label '{label}', skipped", C.YELLOW))
+                continue
+            result[label].append(payload)
+
+    total = sum(len(v) for v in result.values())
+    log("+PL", f"Loaded {col(total, C.BOLD)} custom payloads from {col(path, C.CYAN)}", C.GREEN)
+    return dict(result)
+
+
+# -----------------------------------------------------------------
+#  RESUME / CHECKPOINT HELPERS
+# -----------------------------------------------------------------
+_CHECKPOINT_LOCK = threading.Lock()
+
+def save_checkpoint(path: str, visited: Set[str]) -> None:
+    """Atomically write visited URLs to a checkpoint file."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for url in sorted(visited):
+                f.write(url + "\n")
+        os.replace(tmp, path)
+    except Exception as e:
+        log("CKPT", col(f"Checkpoint save failed: {e}", C.YELLOW), C.YELLOW)
+
+
+def load_checkpoint(path: str) -> Set[str]:
+    """Load previously visited URLs from a checkpoint file."""
+    if not path or not os.path.isfile(path):
+        return set()
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        urls = {line.strip() for line in f if line.strip()}
+    log("CKPT", f"Resumed {col(len(urls), C.BOLD+C.GREEN)} previously visited URLs from {col(path, C.CYAN)}", C.GREEN)
+    return urls
+
+
+# -----------------------------------------------------------------
+#  SCOPE HELPERS
+# -----------------------------------------------------------------
+def load_scope_file(path: Optional[str]) -> List[str]:
+    """
+    Load a scope file — one entry per line, either:
+      - A domain / subdomain  (e.g. example.com, *.example.com)
+      - A CIDR block          (e.g. 192.168.1.0/24)   [stored as-is for now]
+    Lines starting with # are comments.
+    """
+    if not path:
+        return []
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        print(col(f"  [!] Scope file not found: {path}", C.RED))
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        entries = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    log("+SC", f"Loaded {col(len(entries), C.BOLD)} scope entries from {col(path, C.CYAN)}", C.GREEN)
+    return entries
+
+
+def url_in_scope(url: str, scope_entries: List[str], base_domain: str) -> bool:
+    """
+    Return True if url is within scope.
+    scope_entries is empty → fall back to same-domain check vs base_domain.
+    Supports wildcard prefixes: *.example.com matches sub.example.com.
+    """
+    if not scope_entries:
+        return is_same_domain(url, base_domain)
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return False
+    for entry in scope_entries:
+        entry = entry.lstrip("*.")
+        if host == entry or host.endswith("." + entry):
+            return True
+    return False
+
+
 # Registry: order determines the output order in the summary
 _DEEP_FUZZ_CHECKS: List[DeepFuzzCheck] = [
     SQLiCheck(),
@@ -1633,6 +1916,8 @@ _DEEP_FUZZ_CHECKS: List[DeepFuzzCheck] = [
     PathTraversalCheck(),
     SSRFCheck(),
     OpenRedirectCheck(),
+    HeaderInjectionCheck(),
+    IDORCheck(),
 ]
 
 
@@ -1676,23 +1961,25 @@ class ParamFuzzer:
     def __init__(self, target_url, param_list, threads, timeout, session,
                  delay, hits_out, stop_event: threading.Event = None,
                  method="GET", rotate_ua=False, proxy_mgr=None,
-                 smart_fuzz=False, deep_fuzz=False):
-        self.target_url = target_url
-        self.param_list = param_list
-        self.threads    = threads
-        self.timeout    = timeout
-        self.session    = session
-        self.delay      = delay
-        self.hits_out   = hits_out
-        self.stop_event = stop_event or threading.Event()
-        self.method     = method.upper()
-        self.rotate_ua  = rotate_ua
-        self.proxy_mgr  = proxy_mgr
-        self.smart_fuzz = smart_fuzz or deep_fuzz  # deep implies smart
-        self.deep_fuzz  = deep_fuzz
-        self._q         = queue.Queue()
-        self._lock      = threading.Lock()
-        self._done      = 0
+                 smart_fuzz=False, deep_fuzz=False,
+                 custom_payloads: Dict[str, List[str]] = None):
+        self.target_url     = target_url
+        self.param_list     = param_list
+        self.threads        = threads
+        self.timeout        = timeout
+        self.session        = session
+        self.delay          = delay
+        self.hits_out       = hits_out
+        self.stop_event     = stop_event or threading.Event()
+        self.method         = method.upper()
+        self.rotate_ua      = rotate_ua
+        self.proxy_mgr      = proxy_mgr
+        self.smart_fuzz     = smart_fuzz or deep_fuzz  # deep implies smart
+        self.deep_fuzz      = deep_fuzz
+        self.custom_payloads = custom_payloads or {}
+        self._q             = queue.Queue()
+        self._lock          = threading.Lock()
+        self._done          = 0
         self._hits:      List[Dict] = []
         self._deep_hits: List[Dict] = []
         self._base_code = 0
@@ -1830,21 +2117,39 @@ class ParamFuzzer:
         Time-based payloads get an extended per-request timeout so a
         legitimate 3-second SLEEP doesn't time-out before we can observe
         the delay.
+
+        Custom payloads from --payload-file are merged into each check's
+        payload list before building the triple list.
         """
-        log_section("DEEP FUZZ  (SQLi / XSS / PathTraversal / SSRF / OpenRedirect)")
+        log_section("DEEP FUZZ  (SQLi / XSS / PathTraversal / SSRF / OpenRedirect / HeaderInjection / IDOR)")
 
         params = [p.strip() for p in self.param_list]
-        # Build (param, check, payload) triples
-        triples: List[Tuple[str, DeepFuzzCheck, str]] = [
-            (param, check, payload)
-            for param in params
-            for check in _DEEP_FUZZ_CHECKS
-            for payload in check.PAYLOADS
-        ]
+
+        # Merge custom payloads into each check
+        active_checks = list(_DEEP_FUZZ_CHECKS)
+        if self.custom_payloads:
+            for check in active_checks:
+                extras = self.custom_payloads.get(check.LABEL, [])
+                if extras:
+                    check.PAYLOADS = list(check.PAYLOADS) + extras
+                    log("DEEP", f"Added {col(len(extras), C.BOLD)} custom payload(s) to {col(check.LABEL, C.MAGENTA)}", C.MAGENTA)
+
+        # Build (param, check, payload) triples —
+        # IDOR and HeaderInjection use special probing logic, skip normal triples for them
+        triples: List[Tuple[str, DeepFuzzCheck, str]] = []
+        for param in params:
+            for check in active_checks:
+                if isinstance(check, (IDORCheck, HeaderInjectionCheck)):
+                    # Add one sentinel triple per param; handled specially in _probe_deep
+                    triples.append((param, check, "__special__"))
+                else:
+                    for payload in check.PAYLOADS:
+                        triples.append((param, check, payload))
+
         total = len(triples)
         log("DEEP",
             f"{col(len(params), C.BOLD)} params × "
-            f"{col(len(_DEEP_FUZZ_CHECKS), C.BOLD)} checks = "
+            f"{col(len(active_checks), C.BOLD)} checks = "
             f"{col(total, C.BOLD+C.MAGENTA)} probes",
             C.MAGENTA)
 
@@ -1902,8 +2207,48 @@ class ParamFuzzer:
         """Send one (param, payload) probe and run the appropriate detector."""
         proxies = self.proxy_mgr.next() if self.proxy_mgr else None
 
-        # Time-based payloads need a longer socket timeout so the sleep
-        # completes before we read elapsed time.
+        with self._lock:
+            done_counter[0] += 1
+            pct = int(done_counter[0] / total * 100)
+
+        # ---- HeaderInjection: special probing via send_custom ----
+        if isinstance(check, HeaderInjectionCheck) and payload == "__special__":
+            triggered, evidence = check.send_custom(
+                self.session, self.target_url, param,
+                self.timeout, self.rotate_ua, proxies
+            )
+            if triggered:
+                self._record_deep_hit(check, param, "Host-header-inject", evidence, None, 0, pct)
+            # Also run CRLF payloads normally
+            for crlf_payload in [p for p in HeaderInjectionCheck.PAYLOADS if "crlf_inject:" in p]:
+                sep = "&" if "?" in self.target_url else "?"
+                url = f"{self.target_url}{sep}{param}={quote(crlf_payload)}"
+                try:
+                    resp = self.session.get(url, timeout=self.timeout,
+                                            proxies=proxies, allow_redirects=False)
+                    t2, e2 = check.detect(crlf_payload, resp, 0)
+                    if t2:
+                        self._record_deep_hit(check, param, crlf_payload, e2, resp, 0, pct)
+                except Exception:
+                    pass
+            return
+
+        # ---- IDOR: special probing via probe_idor ----
+        if isinstance(check, IDORCheck) and payload == "__special__":
+            # Get baseline value for this param from the URL
+            qs = parse_qs(urlparse(self.target_url).query, keep_blank_values=True)
+            baseline_val = (qs.get(param) or ["1"])[0]
+            findings = check.probe_idor(
+                self.session, self.target_url, param,
+                baseline_val, self._base_len, self._base_code,
+                self.timeout, self.rotate_ua, proxies
+            )
+            for triggered, evidence, tested_val in findings:
+                if triggered:
+                    self._record_deep_hit(check, param, tested_val, evidence, None, 0, pct)
+            return
+
+        # ---- Standard probe ----
         _sleep_re = re.compile(r"sleep\s*\(|pg_sleep|waitfor\s+delay", re.I)
         req_timeout = (
             self.timeout + self._SLEEP_EXTRA_TIMEOUT
@@ -1932,45 +2277,42 @@ class ParamFuzzer:
             )
         elapsed = time.monotonic() - t_start
 
-        with self._lock:
-            done_counter[0] += 1
-            pct = int(done_counter[0] / total * 100)
-
         triggered, evidence = check.detect(payload, resp, elapsed)
 
         if triggered:
-            hit = {
-                "check":    check.LABEL,
-                "severity": check.SEVERITY,
-                "param":    param,
-                "payload":  payload,
-                "url":      self.target_url,
-                "status":   resp.status_code if resp else None,
-                "elapsed":  round(elapsed, 2),
-                "evidence": evidence,
-            }
-            with self._lock:
-                self._deep_hits.append(hit)
-                self.hits_out.append(hit)
-
-            # Immediate inline alert
-            sev_str = col(f"[{check.SEVERITY}]",
-                          DeepFuzzCheck._SEV_COLOR.get(check.SEVERITY, C.WHITE))
-            with _log_lock:
-                print(
-                    f"  {ts()}  {col(f'DEEP {pct:>3}%', C.MAGENTA)}  "
-                    f"{sev_str}  {col(check.LABEL, C.MAGENTA+C.BOLD)}  "
-                    f"param={col(param, C.YELLOW)}  "
-                    f"payload={col(repr(payload[:30]), C.WHITE)}\n"
-                    f"  {' '*12}evidence: {col(evidence[:100], C.RED)}"
-                )
+            self._record_deep_hit(check, param, payload, evidence, resp, elapsed, pct)
         else:
-            # Quiet progress dot — one per probe keeps the terminal alive
-            # without flooding it
             if done_counter[0] % max(1, total // 40) == 0:
                 log(f"DEEP {pct:>3}%",
                     f"{col(check.LABEL, C.GRAY)}  {col(param, C.GRAY)}",
                     C.GRAY)
+
+    def _record_deep_hit(self, check, param, payload, evidence, resp, elapsed, pct):
+        """Record and immediately print a deep-fuzz finding."""
+        hit = {
+            "check":    check.LABEL,
+            "severity": check.SEVERITY,
+            "param":    param,
+            "payload":  payload,
+            "url":      self.target_url,
+            "status":   resp.status_code if resp else None,
+            "elapsed":  round(elapsed, 2),
+            "evidence": evidence,
+        }
+        with self._lock:
+            self._deep_hits.append(hit)
+            self.hits_out.append(hit)
+
+        sev_str = col(f"[{check.SEVERITY}]",
+                      DeepFuzzCheck._SEV_COLOR.get(check.SEVERITY, C.WHITE))
+        with _log_lock:
+            print(
+                f"  {ts()}  {col(f'DEEP {pct:>3}%', C.MAGENTA)}  "
+                f"{sev_str}  {col(check.LABEL, C.MAGENTA+C.BOLD)}  "
+                f"param={col(param, C.YELLOW)}  "
+                f"payload={col(repr(str(payload)[:30]), C.WHITE)}\n"
+                f"  {' '*12}evidence: {col(evidence[:100], C.RED)}"
+            )
 
 
 # -----------------------------------------------------------------
@@ -2209,6 +2551,20 @@ class ParamSpecter:
         self.max_retries    = getattr(args, "max_retries", 3)
         self.smart_fuzz     = getattr(args, "smart_fuzz", False)
 
+        # Output directory
+        self.output_dir = getattr(args, "output_dir", None) or "."
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Scope entries (from --scope-file)
+        self.scope_entries: List[str] = load_scope_file(getattr(args, "scope_file", None))
+
+        # Custom payloads (from --payload-file)
+        self.custom_payloads: Dict[str, List[str]] = load_payload_file(getattr(args, "payload_file", None))
+
+        # Rate limit (requests/sec per host, CLI overrides thread-based default)
+        cli_rate = getattr(args, "rate_limit", None)
+        self._host_rate = float(cli_rate) if cli_rate else max(1.0, self.threads * 0.8)
+
         # Session
         self.session = requests.Session()
         self.session.headers.update({
@@ -2250,10 +2606,14 @@ class ParamSpecter:
             proxy_list = [p.strip() for p in args.proxies.split(",") if p.strip()]
         self.proxy_mgr = ProxyManager(proxy_list) if proxy_list else None
 
-        # Crawl state
+        # Crawl state — resume from checkpoint if requested
+        self._checkpoint_file = getattr(args, "resume_file", None) or \
+            os.path.join(self.output_dir, f"paramspecter_{self.base_domain.replace('.','_')}_checkpoint.txt")
+        _resume = getattr(args, "resume", False)
+
         self.crawl_queue = CrawlQueue(strategy=self.strategy)
         self.crawl_queue.put((self.start_url, 0))
-        self.visited: Set[str]        = set()
+        self.visited: Set[str]        = load_checkpoint(self._checkpoint_file) if _resume else set()
         self.visited_hashes: Set[str] = set()
         self.visited_lock             = threading.Lock()
         self.results: List[Dict]      = []
@@ -2302,8 +2662,6 @@ class ParamSpecter:
                 log("ROBOTS", f"Honoring crawl-delay: {self.delay}s", C.YELLOW)
 
         # Per-host token-bucket rate limiters (bounded dict to prevent memory leak)
-        # Rate = threads * 0.8 req/s per host by default, configurable later.
-        self._host_rate = max(1.0, self.threads * 0.8)
         self._host_buckets: Dict[str, TokenBucket] = {}
         self._host_buckets_lock = threading.Lock()
 
@@ -2376,6 +2734,13 @@ class ParamSpecter:
                     self.crawl_queue.task_done()
                     continue
                 self.visited.add(url)
+                # Periodically save checkpoint every 50 pages
+                if len(self.visited) % 50 == 0:
+                    threading.Thread(
+                        target=save_checkpoint,
+                        args=(self._checkpoint_file, set(self.visited)),
+                        daemon=True
+                    ).start()
 
             with self.results_lock:
                 if self.stats.pages_crawled >= self.max_pages:
@@ -2527,13 +2892,19 @@ class ParamSpecter:
                         self.missing_sec_headers[sh] += 1
 
             # Enqueue new links
-            if depth < self.depth and not self._stop_event.is_set()                     and ("html" in mime or mime in CRAWLABLE_MIME):
+            if depth < self.depth and not self._stop_event.is_set() \
+                    and ("html" in mime or mime in CRAWLABLE_MIME):
                 for link in pd["links"]:
                     if self._stop_event.is_set():
                         break
                     with self.visited_lock:
                         if link not in self.visited:
-                            if not self.same_domain or is_same_domain(link, self.base_domain):
+                            in_scope = (
+                                url_in_scope(link, self.scope_entries, self.base_domain)
+                                if (self.scope_entries or not self.same_domain)
+                                else is_same_domain(link, self.base_domain)
+                            )
+                            if in_scope:
                                 self.crawl_queue.put((link, depth + 1), priority=depth + 1)
                                 self.stats.links_found += 1
 
@@ -2544,7 +2915,12 @@ class ParamSpecter:
                     norm_ep = normalize_url(ep_url, url)
                     if not norm_ep:
                         continue
-                    if not self.same_domain or is_same_domain(norm_ep, self.base_domain):
+                    in_scope = (
+                        url_in_scope(norm_ep, self.scope_entries, self.base_domain)
+                        if (self.scope_entries or not self.same_domain)
+                        else is_same_domain(norm_ep, self.base_domain)
+                    )
+                    if in_scope:
                         with self.visited_lock:
                             if norm_ep not in self.visited:
                                 self.crawl_queue.put((norm_ep, depth + 1), priority=depth + 1)
@@ -2629,6 +3005,7 @@ class ParamSpecter:
             rotate_ua=self.rotate_ua, proxy_mgr=self.proxy_mgr,
             smart_fuzz=self.smart_fuzz,
             deep_fuzz=getattr(a, "deep_fuzz", False),
+            custom_payloads=self.custom_payloads,
         ).run()
 
     # ---- subdomain hunt ----
@@ -2830,7 +3207,11 @@ class ParamSpecter:
     # ---- save ----
     def save_results(self):
         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pfx = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
+        base_pfx = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
+        pfx = os.path.join(self.output_dir, base_pfx)
+
+        # Save final checkpoint
+        save_checkpoint(self._checkpoint_file, self.visited)
 
         meta = {
             "target": self.start_url, "mode": self.mode, "strategy": self.strategy,
@@ -2960,6 +3341,138 @@ class ParamSpecter:
                     extra_fn=_fix_sub
                 )
 
+        # ---- HTML report ----
+        self._save_html_report(pfx)
+
+    # ---- HTML report ----
+    def _save_html_report(self, pfx: str) -> None:
+        """Generate a self-contained HTML summary report."""
+        html_path = f"{pfx}_report.html"
+
+        def _esc(s):
+            return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"','&quot;')
+
+        def _rows(items, fields):
+            rows = ""
+            for item in items:
+                rows += "<tr>" + "".join(f"<td>{_esc(item.get(f,''))}</td>" for f in fields) + "</tr>\n"
+            return rows
+
+        def _th(fields):
+            return "<tr>" + "".join(f"<th>{_esc(f)}</th>" for f in fields) + "</tr>"
+
+        secrets_html = ""
+        for s in self.all_secrets:
+            secrets_html += (
+                f"<tr><td><span class='badge badge-red'>{_esc(s.get('type','?'))}</span></td>"
+                f"<td><code>{_esc(s.get('value','')[:80])}</code></td>"
+                f"<td>{_esc(s.get('source',''))}</td></tr>\n"
+            )
+
+        param_hits_html = _rows(self.param_hits, ["param","url","status","size_diff","reflected","payload"])
+        dir_hits_html   = _rows(self.dir_hits,   ["url","status","size","redirect"])
+        sub_hits_html   = ""
+        for h in self.subdomain_hits:
+            sub_hits_html += (
+                f"<tr><td>{_esc(h.get('subdomain',''))}</td>"
+                f"<td>{_esc(', '.join(h.get('ips',[])))} </td>"
+                f"<td>{_esc(h.get('status',''))}</td>"
+                f"<td>{_esc(h.get('method',''))}</td></tr>\n"
+            )
+
+        tech_badges = " ".join(f"<span class='badge badge-blue'>{_esc(t)}</span>" for t in sorted(self.all_techs))
+        waf_badges  = " ".join(f"<span class='badge badge-yellow'>{_esc(w)}</span>" for w in sorted(self.all_wafs))
+        param_list  = " ".join(f"<span class='badge badge-gray'>?{_esc(p)}</span>" for p in sorted(self.all_params)[:80])
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ParamSpecter v5.0 Report — {_esc(self.start_url)}</title>
+<style>
+  :root{{--red:#e74c3c;--green:#2ecc71;--blue:#3498db;--yellow:#f39c12;--gray:#95a5a6;--dark:#1a1a2e;--card:#16213e;--text:#e0e0e0}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:var(--dark);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;padding:20px}}
+  h1{{color:var(--red);font-size:1.8rem;margin-bottom:4px}}
+  h2{{color:var(--blue);font-size:1.1rem;margin:20px 0 8px;border-bottom:1px solid #333;padding-bottom:4px}}
+  .meta{{color:var(--gray);font-size:.85rem;margin-bottom:20px}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}}
+  .card{{background:var(--card);border-radius:8px;padding:16px;text-align:center;border:1px solid #2a2a4a}}
+  .card .num{{font-size:2rem;font-weight:700;color:var(--red)}}
+  .card .lbl{{font-size:.8rem;color:var(--gray);margin-top:4px}}
+  table{{width:100%;border-collapse:collapse;font-size:.85rem;margin-bottom:16px}}
+  th{{background:#0f3460;color:var(--text);padding:8px;text-align:left}}
+  td{{padding:7px 8px;border-bottom:1px solid #222;word-break:break-all}}
+  tr:hover td{{background:#1e2a45}}
+  .badge{{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.75rem;margin:2px}}
+  .badge-red{{background:#5c1a1a;color:#ff8080}}
+  .badge-blue{{background:#1a3a5c;color:#80c8ff}}
+  .badge-yellow{{background:#5c4a1a;color:#ffd080}}
+  .badge-gray{{background:#2a2a2a;color:#aaa}}
+  code{{background:#0d1117;padding:1px 5px;border-radius:3px;font-family:monospace;font-size:.82rem}}
+  .warn{{background:#5c3a1a;border:1px solid var(--yellow);border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:.9rem}}
+  .section{{background:var(--card);border-radius:8px;padding:16px;margin-bottom:16px;border:1px solid #2a2a4a}}
+</style>
+</head>
+<body>
+<h1>⚡ ParamSpecter v5.0 — Scan Report</h1>
+<p class="meta">Target: <strong>{_esc(self.start_url)}</strong> &nbsp;|&nbsp;
+Mode: {_esc(self.mode)} &nbsp;|&nbsp;
+Duration: {_esc(self.stats.elapsed())} &nbsp;|&nbsp;
+Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
+
+<div class="warn">⚠️ For authorized security testing only. Do not use against targets without explicit written permission.</div>
+
+<div class="grid">
+  <div class="card"><div class="num">{self.stats.pages_crawled}</div><div class="lbl">Pages Crawled</div></div>
+  <div class="card"><div class="num">{len(self.all_params)}</div><div class="lbl">URL Params</div></div>
+  <div class="card"><div class="num">{len(self.all_emails)}</div><div class="lbl">Emails</div></div>
+  <div class="card"><div class="num">{len(self.all_secrets)}</div><div class="lbl">Possible Secrets</div></div>
+  <div class="card"><div class="num">{len(self.dir_hits)}</div><div class="lbl">Dir Hits</div></div>
+  <div class="card"><div class="num">{len(self.param_hits)}</div><div class="lbl">Param Hits</div></div>
+  <div class="card"><div class="num">{len(self.subdomain_hits)}</div><div class="lbl">Subdomains</div></div>
+  <div class="card"><div class="num">{self.all_forms}</div><div class="lbl">Forms Found</div></div>
+</div>
+
+<div class="section">
+  <h2>Technologies Detected</h2>
+  <p>{tech_badges or '<span style="color:var(--gray)">None detected</span>'}</p>
+  <h2 style="margin-top:12px">WAF Detected</h2>
+  <p>{waf_badges or '<span style="color:var(--gray)">None detected</span>'}</p>
+</div>
+
+<div class="section">
+  <h2>URL Parameters Discovered</h2>
+  <p>{param_list or '<span style="color:var(--gray)">None</span>'}</p>
+</div>
+
+{"<div class='section'><h2>⚠️ Possible Secrets (" + str(len(self.all_secrets)) + ")</h2><table><thead>" + _th(["Type","Value","Source"]) + "</thead><tbody>" + secrets_html + "</tbody></table></div>" if self.all_secrets else ""}
+
+{"<div class='section'><h2>Emails Found</h2><p>" + " ".join(f"<span class='badge badge-gray'>{_esc(e)}</span>" for e in sorted(self.all_emails)) + "</p></div>" if self.all_emails else ""}
+
+{"<div class='section'><h2>Directory / File Hits (" + str(len(self.dir_hits)) + ")</h2><table><thead>" + _th(["URL","Status","Size","Redirect"]) + "</thead><tbody>" + dir_hits_html + "</tbody></table></div>" if self.dir_hits else ""}
+
+{"<div class='section'><h2>Parameter Hits (" + str(len(self.param_hits)) + ")</h2><table><thead>" + _th(["Param","URL","Status","Size Delta","Reflected","Payload"]) + "</thead><tbody>" + param_hits_html + "</tbody></table></div>" if self.param_hits else ""}
+
+{"<div class='section'><h2>Subdomains Found (" + str(len(self.subdomain_hits)) + ")</h2><table><thead>" + _th(["Subdomain","IPs","Status","Method"]) + "</thead><tbody>" + sub_hits_html + "</tbody></table></div>" if self.subdomain_hits else ""}
+
+<div class="section">
+  <h2>Missing Security Headers</h2>
+  {"<table><thead>" + _th(["Header","Pages Missing"]) + "</thead><tbody>" + "".join(f"<tr><td>{_esc(h)}</td><td>{c}</td></tr>" for h,c in sorted(self.missing_sec_headers.items(), key=lambda x:-x[1])) + "</tbody></table>" if self.missing_sec_headers else "<p style='color:var(--gray)'>All checked</p>"}
+</div>
+
+</body></html>"""
+
+        try:
+            tmp = html_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(html)
+            os.replace(tmp, html_path)
+            log("SAVED", f"HTML -> {col(html_path, C.CYAN)}", C.GREEN)
+        except Exception as e:
+            log("SAVE", col(f"HTML report failed: {e}", C.YELLOW), C.YELLOW)
+
     # ---- export targets for downstream tools ----
     def export_targets(self) -> Tuple[str, str]:
         """
@@ -3051,7 +3564,8 @@ class ParamSpecter:
 
         # ---- write files atomically ----
         ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pfx      = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
+        base_pfx = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
+        pfx      = os.path.join(self.output_dir, base_pfx)
         t_path   = f"{pfx}_targets.txt"
         sql_path = f"{pfx}_sqlmap_targets.txt"
 
@@ -3106,12 +3620,26 @@ def main():
           Parameter fuzzing (smart = 6 payloads per param):
             python ParamSpecter.py https://example.com/search --mode param --smart-fuzz
 
-          Deep vulnerability scan (SQLi / XSS / LFI / SSRF / redirect):
+          Deep vulnerability scan (SQLi / XSS / LFI / SSRF / redirect / header / IDOR):
             python ParamSpecter.py https://example.com/search --mode param --deep-fuzz
             python ParamSpecter.py https://example.com/search --mode param --deep-fuzz --param-method POST
+            python ParamSpecter.py https://example.com/search --mode param --deep-fuzz --payload-file my_payloads.txt
 
           Full recon in one shot:
             python ParamSpecter.py https://example.com --mode full -t 20 --ignore-robots
+
+          Multi-domain scope file:
+            python ParamSpecter.py https://example.com --mode full --scope-file scope.txt
+
+          Rate limiting (max 5 req/s per host):
+            python ParamSpecter.py https://example.com --rate-limit 5
+
+          Resume an interrupted scan:
+            python ParamSpecter.py https://example.com --resume
+            python ParamSpecter.py https://example.com --resume --resume-file /tmp/my_checkpoint.txt
+
+          Save all output to a specific directory:
+            python ParamSpecter.py https://example.com --output-dir /tmp/scans/example/
 
           Deep crawl with UA rotation and Burp proxy:
             python ParamSpecter.py https://example.com --depth 6 -t 15 --rotate-ua --proxies http://127.0.0.1:8080
@@ -3219,8 +3747,41 @@ def main():
                        "  Path traversal: /etc/passwd + win.ini content matching\n"
                        "  SSRF: AWS/GCP/Azure metadata endpoint probing\n"
                        "  Open redirect: Location header + meta-refresh inspection\n"
+                       "  Header injection: Host header + CRLF injection\n"
+                       "  IDOR: numeric ID incrementation across params\n"
                        "  Each finding printed with param, payload, evidence, and HIGH/MEDIUM/LOW severity."
                    ))
+    p.add_argument("--payload-file", default=None, metavar="FILE",
+                   help=(
+                       "Custom payload file for --deep-fuzz.\n"
+                       "Format: one entry per line as LABEL:payload\n"
+                       "  e.g.  SQLi:' OR SLEEP(5)--\n"
+                       "        XSS:<img src=x onerror=alert(1)>\n"
+                       "Valid labels: SQLi, XSS, PathTraversal, SSRF, OpenRedirect, HeaderInjection, IDOR"
+                   ))
+
+    # Scope
+    p.add_argument("--scope-file",   default=None, metavar="FILE",
+                   help=(
+                       "File of in-scope domains (one per line, wildcards supported).\n"
+                       "  e.g.  example.com\n"
+                       "        *.example.com\n"
+                       "When set, replaces the default same-domain restriction."
+                   ))
+
+    # Rate limiting
+    p.add_argument("--rate-limit",   type=float, default=None, metavar="REQ/S",
+                   help="Max requests per second per host (default: threads * 0.8)")
+
+    # Resume
+    p.add_argument("--resume",       action="store_true",
+                   help="Resume a previous scan — skip already-visited URLs from checkpoint file")
+    p.add_argument("--resume-file",  default=None, metavar="FILE",
+                   help="Path to checkpoint file (default: auto-named in --output-dir)")
+
+    # Output directory
+    p.add_argument("--output-dir",   default=".", metavar="DIR",
+                   help="Directory for all output files (default: current directory)")
 
     args = p.parse_args()
 
@@ -3239,7 +3800,10 @@ def main():
     print(f"  {'URL':<{W}} {col(args.url, C.CYAN)}")
     print(f"  {'Mode':<{W}} {col(args.mode, C.YELLOW)}")
     print(f"  {'Output format':<{W}} {col(args.output, C.WHITE)}")
+    print(f"  {'Output dir':<{W}} {col(args.output_dir, C.WHITE)}")
     print(f"  {'Export targets':<{W}} {_yn(args.export_targets)}")
+    if args.scope_file:
+        print(f"  {'Scope file':<{W}} {col(args.scope_file, C.CYAN)}")
     print(sep)
     print(f"  {col('CRAWL SETTINGS', C.BOLD+C.WHITE)}")
     print(f"  {'Threads':<{W}} {col(args.threads, C.WHITE)}")
@@ -3248,11 +3812,13 @@ def main():
     print(f"  {'Delay':<{W}} {col(str(args.delay) + 's', C.WHITE)}")
     print(f"  {'Timeout':<{W}} {col(str(args.timeout) + 's', C.WHITE)}")
     print(f"  {'Max retries':<{W}} {col(args.max_retries, C.WHITE)}")
+    print(f"  {'Rate limit':<{W}} {col(str(args.rate_limit) + ' req/s' if args.rate_limit else 'auto', C.WHITE)}")
     print(f"  {'Strategy':<{W}} {col(args.strategy, C.WHITE)}")
     print(f"  {'Rotate UA':<{W}} {_yn(args.rotate_ua)}")
     print(f"  {'Follow external':<{W}} {_yn(args.follow_external)}")
     print(f"  {'Ignore robots':<{W}} {_yn(args.ignore_robots)}")
     print(f"  {'Playwright':<{W}} {_yn(args.playwright)}")
+    print(f"  {'Resume':<{W}} {_yn(args.resume)}")
     if args.login_url:
         print(sep)
         print(f"  {col('FORM LOGIN', C.BOLD+C.WHITE)}")
@@ -3278,6 +3844,8 @@ def main():
         print(f"  {'Method':<{W}} {col(args.param_method, C.WHITE)}")
         print(f"  {'Smart fuzz':<{W}} {_yn(args.smart_fuzz)}")
         print(f"  {'Deep fuzz':<{W}} {_yn(args.deep_fuzz)}")
+        if args.payload_file:
+            print(f"  {'Payload file':<{W}} {col(args.payload_file, C.CYAN)}")
     if args.mode in ("subdomain", "full"):
         print(sep)
         print(f"  {col('SUBDOMAIN ENUM', C.BOLD+C.WHITE)}")
