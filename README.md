@@ -4,7 +4,7 @@
 
 ---
 
-# ParamSpecter v4.3 — Advanced Recon Crawler
+# ParamSpecter v5.0 — Advanced Recon Crawler
 
 > **For authorized and educational use ONLY.**
 > Only test targets you own or have explicit written permission to test.
@@ -14,13 +14,42 @@
 
 ## What is ParamSpecter?
 
-ParamSpecter is an advanced reconnaissance web crawler built for bug bounty hunting and security research. It performs deep recursive crawling, subdomain discovery, directory and file enumeration, parameter fuzzing with active vulnerability detection, JS analysis, secret detection, technology fingerprinting, automated form login, JS-rendered page crawling via Playwright, and downstream tool target export — all from a single command.
+ParamSpecter is an advanced reconnaissance web crawler built for bug bounty hunting and security research. It performs deep recursive crawling, subdomain discovery, directory and file enumeration, parameter fuzzing with active vulnerability detection, JS analysis, secret detection, technology fingerprinting, automated form login, JS-rendered page crawling via Playwright, multi-domain scope control, scan resumption, custom payload injection, and downstream tool target export — all from a single command.
 
 ---
 
 ## Changelog
 
-### v4.3 — Current Release
+### v5.0 — Current Release
+
+**New features**
+
+| Feature | Flag | Description |
+|---|---|---|
+| Header Injection check | `--deep-fuzz` | Detects Host header injection (password reset poisoning, cache poisoning) and CRLF injection (`%0d%0a`) by checking if the canary host or injected header appears in the response body or `Location` header |
+| IDOR check | `--deep-fuzz` | For every numeric parameter, probes `id±1`, `id+100`, and `id=0`; flags status-code changes (e.g. 403→200) and significant response-size deltas indicating a different record was returned |
+| Custom payload file | `--payload-file FILE` | Inject your own payloads into any deep-fuzz category. Format: `LABEL:payload` per line. Valid labels: `SQLi`, `XSS`, `PathTraversal`, `SSRF`, `OpenRedirect`, `HeaderInjection`, `IDOR` |
+| Scope file | `--scope-file FILE` | One domain or wildcard per line (`*.example.com`). Replaces the default same-domain restriction for multi-domain bug bounty programs |
+| Rate limit CLI | `--rate-limit REQ/S` | Explicit per-host request rate (overrides the default `threads × 0.8`). Applies to the TokenBucket used by every worker thread |
+| Resume / checkpoint | `--resume` | Skips already-visited URLs loaded from a checkpoint file. Checkpoint is auto-saved every 50 pages and on graceful stop |
+| Output directory | `--output-dir DIR` | All output files (JSON, CSV, HTML report, checkpoint, target lists) are written here |
+| HTML report | automatic | Self-contained dark-theme HTML report with summary cards, technology/WAF badges, secrets table, param hits, dir hits, and subdomain results. Written alongside JSON/CSV on every scan |
+
+**Deep-fuzz check registry (v5.0)**
+
+| Check | Severity | New in v5.0 |
+|---|---|---|
+| SQLi | HIGH | — |
+| XSS | HIGH | — |
+| PathTraversal | HIGH | — |
+| SSRF | HIGH | — |
+| OpenRedirect | MEDIUM | — |
+| **HeaderInjection** | HIGH | ✓ |
+| **IDOR** | HIGH | ✓ |
+
+---
+
+### v4.3
 
 **New features**
 
@@ -40,7 +69,7 @@ ParamSpecter is an advanced reconnaissance web crawler built for bug bounty hunt
 | Content dedup | Volatile token stripping now **context-aware** — only strips tokens inside HTML attribute values, not visible body text like Git commit IDs |
 | JS analysis | **Dynamic imports followed** — `import()`, `require.ensure()`, webpack chunks discovered and analyzed |
 | Secrets | **Deduplication** at aggregation — same secret found on 50 pages stored once, not 50 times |
-| Wildcard detection | **stdev=0 floor** — proportional threshold (3% of baseline, min 32B) instead of flat 100B, handles zero-delay probes correctly |
+| Wildcard detection | **stdev=0 floor** — proportional threshold (3% of baseline, min 32B) instead of flat 100B |
 | Concurrency | **`threading.Barrier`** completion — no polling loop, no race window between queue empty and task_done |
 | Output | All output files written **atomically** (temp + rename) — corrupt files on Ctrl+C are impossible |
 
@@ -60,13 +89,13 @@ ParamSpecter is an advanced reconnaissance web crawler built for bug bounty hunt
 | Bug | Fix |
 |---|---|
 | `CrawlQueue.get()` crash on Empty in priority mode | Priority tuple unwrapped after get, not inline |
-| `internal_paths` regex stray space in `[ ^"'<>]` | Fixed to `[^"'<>]` |
+| `internal_paths` regex stray space | Fixed to `[^"'<>]` |
 | `pages_crawled` incremented before fetch | Moved to after successful fetch |
 | Blocking `queue.join()` hangs on Ctrl+C | Replaced with stop-event-aware drain loop |
-| Workers (subdomain/dir/param) ignored stop event | All workers check stop event each iteration |
-| `except: pass` silently swallowing all errors | Replaced with logged `except Exception as e` |
+| Workers ignored stop event | All workers check stop event each iteration |
+| `except: pass` silently swallowing errors | Replaced with logged `except Exception as e` |
 | Second Ctrl+C had no effect | Now force-quits immediately |
-| Phases 2–4 launched even after Ctrl+C in phase 1 | Each phase gated on stop event |
+| Phases 2–4 launched after Ctrl+C in phase 1 | Each phase gated on stop event |
 
 ### v4.0 — Major Features
 
@@ -120,11 +149,27 @@ python ParamSpecter.py https://example.com --mode fuzz -w dirs.txt -x .php,.html
 # Parameter fuzzing (smart = 6 payloads per param)
 python ParamSpecter.py https://example.com/search --mode param --smart-fuzz
 
-# Deep vulnerability scan (SQLi / XSS / LFI / SSRF / open redirect)
+# Deep vulnerability scan (SQLi / XSS / LFI / SSRF / redirect / header injection / IDOR)
 python ParamSpecter.py https://example.com/search --mode param --deep-fuzz
+
+# Deep fuzz with custom payloads
+python ParamSpecter.py https://example.com/search --mode param --deep-fuzz --payload-file my_payloads.txt
 
 # Full recon: all four phases in order
 python ParamSpecter.py https://example.com --mode full -t 20 --ignore-robots
+
+# Multi-domain scope file
+python ParamSpecter.py https://example.com --mode full --scope-file scope.txt
+
+# Rate limiting (max 5 req/s per host)
+python ParamSpecter.py https://example.com --rate-limit 5
+
+# Resume an interrupted scan
+python ParamSpecter.py https://example.com --resume
+python ParamSpecter.py https://example.com --resume --resume-file /tmp/my_checkpoint.txt
+
+# Save all output to a specific directory
+python ParamSpecter.py https://example.com --output-dir /tmp/scans/example/
 
 # JS-rendered crawl with XHR endpoint discovery
 python ParamSpecter.py https://example.com --playwright
@@ -161,7 +206,7 @@ python ParamSpecter.py https://example.com \
   --headers "X-API-Key: mykey" "Authorization: Bearer token123"
 ```
 
-**Ctrl+C once** — graceful stop, saves partial results.
+**Ctrl+C once** — graceful stop, saves partial results and checkpoint.
 **Ctrl+C twice** — force quit immediately.
 
 ---
@@ -187,6 +232,16 @@ crawl:
   --ignore-robots            Ignore robots.txt restrictions
   --playwright               Use headless Chromium for JS rendering + XHR interception
                              Falls back to requests if Playwright is not installed
+
+scope:
+  --scope-file FILE          File of in-scope domains (one per line)
+                             Supports wildcards: *.example.com
+                             Replaces the default same-domain restriction
+
+rate and resume:
+  --rate-limit REQ/S         Max requests per second per host (default: threads × 0.8)
+  --resume                   Resume a previous scan — skips already-visited URLs
+  --resume-file FILE         Path to checkpoint file (default: auto-named in --output-dir)
 
 identity and evasion:
   -u, --user-agent           Custom User-Agent string
@@ -219,11 +274,17 @@ parameter fuzzing:
   --smart-fuzz               Test 6 payloads per param:
                              default value, SQLi, XSS, SSRF, SSTI, path traversal
   --deep-fuzz                Extended per-param vulnerability checks (implies --smart-fuzz):
-                             SQLi, XSS, path traversal, SSRF, open redirect
+                             SQLi, XSS, path traversal, SSRF, open redirect,
+                             header injection, IDOR
                              Prints param / payload / evidence / severity for each finding
+  --payload-file FILE        Custom payload file for --deep-fuzz
+                             Format: LABEL:payload (one per line)
+                             Labels: SQLi, XSS, PathTraversal, SSRF, OpenRedirect,
+                                     HeaderInjection, IDOR
 
 output:
   -o, --output               json | csv | both | jsonl  (default: both)
+  --output-dir DIR           Directory for all output files (default: current directory)
   --export-targets           Write targets.txt and sqlmap_targets.txt after the scan
                              Prints nuclei and sqlmap command lines at the end
 ```
@@ -240,6 +301,7 @@ technology fingerprints, WAF signatures, HTML comments, internal IP leaks, sourc
 and social media links.
 
 Use `--playwright` to render JS-heavy pages with a real browser engine and intercept API calls made at runtime.
+Use `--scope-file` to crawl across multiple domains within the same bug bounty program.
 
 ### subdomain
 Three-phase subdomain discovery:
@@ -253,7 +315,7 @@ Every discovered subdomain is HTTP-probed (HTTPS first, HTTP fallback) with a th
 Directory and file brute-force against the target. Sends 5 random non-existent probes to detect wildcard/catch-all behaviour. Uses mean + 2×stddev threshold to filter false positives. Supports `--recursive` to re-enumerate discovered directories up to `--recursive-depth` levels.
 
 ### param
-Fuzzes URL parameters against the target. Takes a baseline response first (status + size), then tests each parameter. Reports any parameter that causes a different status code, a response size change over 100B, or reflects the payload back in the response body. Use `--smart-fuzz` for full 6-payload coverage. Use `--deep-fuzz` for active vulnerability detection across five categories.
+Fuzzes URL parameters against the target. Takes a baseline response first (status + size), then tests each parameter. Reports any parameter that causes a different status code, a response size change over 100B, or reflects the payload back in the response body. Use `--smart-fuzz` for full 6-payload coverage. Use `--deep-fuzz` for active vulnerability detection across seven categories.
 
 ### full
 Runs all four phases in sequence: crawl → subdomain → fuzz → param.
@@ -266,14 +328,12 @@ If a phase is interrupted with Ctrl+C, subsequent phases are skipped and results
 When `--playwright` is passed, each crawl worker:
 
 1. Opens a dedicated `BrowserContext` in headless Chromium (thread-safe — no shared Page objects)
-2. Navigates to the URL and waits for `networkidle` before extracting HTML, so JS-rendered content and lazy-loaded data are captured
+2. Navigates to the URL and waits for `networkidle` before extracting HTML
 3. Intercepts all `XMLHttpRequest` and `fetch()` calls made by the page, collecting their URLs
 4. Enqueues discovered API endpoints into the main crawl queue for recursive processing
-5. Falls back to a normal `requests` GET if Playwright fails for any reason (network error, timeout, JS crash)
+5. Falls back to a normal `requests` GET if Playwright fails for any reason
 
-The standard `requests` GET still runs alongside Playwright to capture real response headers, cookies, and status codes that the Playwright response object doesn't expose cleanly. The rendered HTML body replaces the raw HTML before analysis.
-
-**Fallback behaviour:** if `playwright` is not installed, the flag is silently ignored with a one-time warning and the crawler continues normally with `requests`.
+The standard `requests` GET still runs alongside Playwright to capture real response headers, cookies, and status codes. The rendered HTML body replaces the raw HTML before analysis.
 
 ---
 
@@ -282,14 +342,11 @@ The standard `requests` GET still runs alongside Playwright to capture real resp
 When `--login-url` is passed, the following happens before any crawl worker starts:
 
 1. **GET** the login page and parse the HTML
-2. **Locate the login form** — selects the `<form>` that contains a `<input type="password">`, falling back to the first form on the page
+2. **Locate the login form** — selects the `<form>` that contains `<input type="password">`, falling back to the first form on the page
 3. **Extract CSRF tokens** — all `<input type="hidden">` fields whose names match `csrf`, `token`, `nonce`, `_wpnonce`, `authenticity_token`, or `__RequestVerificationToken` are captured automatically
-4. **POST** `{user_field: username, pass_field: password, ...csrf_fields}` to the form's `action` URL
-5. **Validate** the response:
-   - Non-2xx status → hard error, exits immediately
-   - Server redirects back to the login page path → hard error with a diagnostic message
-   - Password field still in response body → warning (some apps re-embed the form on success)
-6. **Inject cookies** from the response into the shared `requests.Session` — all worker threads are authenticated from their first request
+4. **POST** credentials + CSRF fields to the form's `action` URL
+5. **Validate** the response — non-2xx status or redirect back to the login page causes a hard exit
+6. **Inject cookies** into the shared `requests.Session` — all worker threads are authenticated from their first request
 
 ```bash
 # Standard login
@@ -298,7 +355,7 @@ python ParamSpecter.py https://example.com \
   --login-user admin \
   --login-pass secret123
 
-# Non-standard field names (e.g. a form using name="email" and name="pwd")
+# Non-standard field names
 python ParamSpecter.py https://example.com \
   --login-url https://example.com/login \
   --login-user admin@corp.com \
@@ -307,22 +364,23 @@ python ParamSpecter.py https://example.com \
   --login-pass-field pwd
 ```
 
-`--login-url` requires both `--login-user` and `--login-pass`. Omitting either causes an immediate argument error before any network traffic.
-
 ---
 
 ## Deep Fuzz (`--deep-fuzz`)
 
-`--deep-fuzz` adds a second pass after the standard smart-fuzz run. It tests every parameter against five vulnerability categories using dedicated payloads and detection logic. `--deep-fuzz` implies `--smart-fuzz` — the baseline pass always runs first.
+`--deep-fuzz` adds a second pass after the standard smart-fuzz run. It tests every parameter against **seven** vulnerability categories using dedicated payloads and detection logic. `--deep-fuzz` implies `--smart-fuzz`.
 
-Each finding is printed immediately during the scan with:
-- **Severity** — `HIGH`, `MEDIUM`, or `LOW` (colour-coded)
-- **Category** — which check triggered
-- **Parameter** — the parameter name that was fuzzed
-- **Payload** — the exact string sent
-- **Evidence** — what in the response triggered the flag (error snippet, reflected content, response time, redirect destination)
+Each finding is printed immediately with severity (colour-coded), category, parameter name, payload, and evidence. A deduplicated summary table prints after all probes complete.
 
-A deduplicated summary table prints after all probes complete.
+You can extend any category's payload list using `--payload-file`:
+
+```
+# my_payloads.txt
+SQLi:' OR SLEEP(10)-- -
+XSS:<details open ontoggle=alert(1)>
+HeaderInjection:crlf_inject:%0d%0aSet-Cookie:injected=1
+IDOR:99999
+```
 
 ### SQL Injection — HIGH
 
@@ -335,7 +393,7 @@ A deduplicated summary table prints after all probes complete.
 | `1 OR 1=1` | DB error keyword |
 | MSSQL `CONVERT` injection | DB error keyword |
 
-Error keywords cover MySQL, PostgreSQL, Oracle, MSSQL, and SQLite. Time-based detection only fires if the payload itself contains a `SLEEP()` / `pg_sleep()` call, preventing slow pages from being misclassified. Sleep-carrying payloads get an extended 8-second socket timeout so the delay completes before the connection closes.
+Error keywords cover MySQL, PostgreSQL, Oracle, MSSQL, and SQLite. Time-based detection only fires if the payload itself contains a sleep call. Sleep-carrying payloads get an extended 8-second socket timeout.
 
 ### XSS — HIGH
 
@@ -345,8 +403,6 @@ Error keywords cover MySQL, PostgreSQL, Oracle, MSSQL, and SQLite. Time-based de
 | `"><img src=x onerror=alert(1)>` | `onerror=alert(1)` appears unencoded |
 | `javascript:alert(1)` | Marker appears unencoded |
 | `'><svg onload=alert(1)>` | `onload=alert(1)` appears unencoded |
-
-A server that HTML-encodes `<` to `&lt;` produces no false positive. Evidence shows 15 characters of surrounding context so you can see which tag or attribute the reflection landed in.
 
 ### Path Traversal / LFI — HIGH
 
@@ -364,11 +420,10 @@ A server that HTML-encodes `<` to `&lt;` produces no false positive. Evidence sh
 | Payload | Detection method |
 |---|---|
 | `http://169.254.169.254/latest/meta-data/` | AWS metadata content in response |
-| `http://169.254.169.254/latest/meta-data/ami-id` | `ami-` pattern in response |
-| `http://metadata.google.internal/computeMetadata/v1/` | `computeMetadata` in response |
+| `http://metadata.google.internal/computeMetadata/v1/` | GCP metadata in response |
 | `http://169.254.169.254/metadata/instance?api-version=...` | Azure instance JSON in response |
 
-Detects reflected SSRF only. For blind SSRF (no response reflection) use an out-of-band collaborator (Burp Collaborator, interactsh).
+Detects reflected SSRF only. For blind SSRF use an out-of-band collaborator (Burp Collaborator, interactsh).
 
 ### Open Redirect — MEDIUM
 
@@ -377,9 +432,32 @@ Detects reflected SSRF only. For blind SSRF (no response reflection) use an out-
 | `https://evil.paramspecter.test` | `Location` header points to canary domain |
 | `//evil.paramspecter.test` (protocol-relative) | Same |
 | `////evil.paramspecter.test` | Same |
-| `https:////evil.paramspecter.test` | Same |
 
-Requests are sent with `allow_redirects=False` so the raw `Location` header is inspectable before following. Also detects `<meta http-equiv="refresh">` redirect targets in the response body. The canary domain `evil.paramspecter.test` will never resolve in DNS, so there is no accidental outbound connection.
+Requests are sent with `allow_redirects=False`. Also detects `<meta http-equiv="refresh">` targets. The canary domain `evil.paramspecter.test` never resolves in DNS.
+
+### Header Injection — HIGH *(new in v5.0)*
+
+| Probe | Detection method |
+|---|---|
+| Spoofed `Host: evil.paramspecter.test` header | Canary host reflected in response body or `Location` header |
+| `%0d%0aX-Injected-Header:paramspecter` in param value | Injected header appears in response headers |
+| `\r\nX-Injected-Header:paramspecter` (raw CRLF) | Same |
+| `%250d%250a...` (double-encoded) | Same |
+
+Host header injection can enable password reset link poisoning and web cache poisoning. CRLF injection can enable response splitting and header smuggling.
+
+### IDOR — HIGH *(new in v5.0)*
+
+For every parameter carrying a numeric value, probes:
+
+| Probe | Detection method |
+|---|---|
+| `id + 1` | Status-code change (e.g. 403→200) or significant response-size delta |
+| `id - 1` | Same |
+| `id + 100` | Same |
+| `id = 0` | Same |
+
+When a size delta is detected on a 200 response, the tool also checks for different owner/account fields in JSON (`"user"`, `"email"`, `"owner"`) and includes them in the evidence. Non-numeric parameters are skipped silently.
 
 ```bash
 # Deep fuzz via GET
@@ -388,47 +466,64 @@ python ParamSpecter.py https://example.com/search --mode param --deep-fuzz
 # Deep fuzz via POST
 python ParamSpecter.py https://example.com/search --mode param --deep-fuzz --param-method POST
 
+# Deep fuzz with custom payloads
+python ParamSpecter.py https://example.com/search --mode param --deep-fuzz --payload-file payloads.txt
+
 # Deep fuzz as part of full recon
 python ParamSpecter.py https://example.com --mode full --deep-fuzz --ignore-robots
 ```
 
 ---
 
+## Scope File (`--scope-file`)
+
+For bug bounty programs with multiple in-scope assets, pass a scope file instead of relying on the default same-domain restriction:
+
+```
+# scope.txt
+example.com
+*.example.com
+api.example-cdn.com
+staging.example.net
+```
+
+Lines starting with `#` are treated as comments. Wildcard entries (`*.example.com`) match any subdomain. When a scope file is provided, the `--follow-external` flag is not needed — ParamSpecter uses the scope list as the authority for what to crawl.
+
+---
+
+## Resume (`--resume`)
+
+Checkpoint files are written automatically every 50 pages crawled and again on graceful stop (Ctrl+C). To resume:
+
+```bash
+# Auto-detect checkpoint in the current directory (or --output-dir)
+python ParamSpecter.py https://example.com --resume
+
+# Specify checkpoint file explicitly
+python ParamSpecter.py https://example.com --resume --resume-file /tmp/scans/checkpoint.txt
+```
+
+The checkpoint file is a plain-text list of visited URLs, one per line, written atomically. Already-visited URLs are skipped immediately on pickup from the crawl queue, so the resumed scan continues exactly where it left off without re-analyzing pages.
+
+---
+
 ## Target Export (`--export-targets`)
 
-After the scan completes, `--export-targets` generates two plain-text files ready for downstream tools.
+After the scan completes, `--export-targets` generates two plain-text files:
 
-### `<pfx>_targets.txt` — all parameterised URLs
-
-Every URL with at least one query parameter that returned HTTP < 400. Sources include directly crawled pages, outbound links discovered in `<a href>` tags (even if not crawled due to depth or page limits), and URLs fuzzed during the param phase.
-
-```
-https://example.com/page?id=1
-https://example.com/search?q=test&page=2
-https://example.com/product?cat=electronics&sort=price
-```
-
-Feed directly to nuclei:
+**`<pfx>_targets.txt`** — every URL with at least one query parameter that returned HTTP < 400. Feed directly to nuclei:
 
 ```bash
 nuclei -l paramspecter_example_com_20240501_120000_targets.txt -t ~/nuclei-templates/
 ```
 
-### `<pfx>_sqlmap_targets.txt` — injectable-looking subset
-
-A filtered subset of `targets.txt` where at least one of these is true:
-
-- A parameter name matches a known injectable identifier: `id`, `uid`, `user_id`, `item_id`, `product_id`, `product`, `item`, `cat`, `category`, `pid`, `sid`, `nid`, `order_id`, and 15 others
-- A parameter carries a pure numeric value (e.g. `?id=42`, `?page=3`, `?ref=17`) — catches renamed ID parameters that the name heuristic would miss
-- The URL appeared in `--deep-fuzz` / `--smart-fuzz` findings (confirmed interesting response)
-
-Feed directly to sqlmap:
+**`<pfx>_sqlmap_targets.txt`** — filtered subset where at least one parameter matches a known injectable name (`id`, `uid`, `product_id`, etc.), carries a numeric value, or appeared in deep-fuzz findings:
 
 ```bash
 sqlmap -m paramspecter_example_com_20240501_120000_sqlmap_targets.txt --batch --dbs
 ```
 
-Both files are written atomically (temp + rename). The ready-to-run commands are printed to the terminal at the end of the scan with the actual generated filenames.
+Both files are written atomically and the ready-to-run commands are printed to the terminal at the end of the scan.
 
 ---
 
@@ -440,7 +535,7 @@ Bearer tokens, JWTs, generic `api_key` / `secret` / `token` JS assignments,
 database connection strings (MySQL, PostgreSQL, MongoDB, Redis, JDBC),
 RSA private keys, Slack / Discord / Telegram tokens.
 
-Secrets found on multiple pages are deduplicated by `(type, value[:40])` — the same key appearing on 50 pages appears once in the output.
+Secrets found on multiple pages are deduplicated by `(type, value[:40])`.
 
 ### Technology Fingerprints (25)
 WordPress, Joomla, Drupal, React, Next.js, Nuxt.js, Angular, Vue.js,
@@ -451,6 +546,7 @@ Django, Laravel, Express.js, FastAPI, Spring, GraphQL, Nginx, Apache, IIS.
 Cloudflare, AWS WAF, Akamai, Sucuri, Incapsula, ModSecurity, Imperva, F5 BIG-IP, Barracuda, Fortinet.
 
 ### Built-in Wordlists
+
 | List | Entries | Coverage |
 |---|---|---|
 | Directories / endpoints | 165 | CMS, API paths, dev/debug, sensitive files, upload dirs, infra |
@@ -460,60 +556,34 @@ Cloudflare, AWS WAF, Akamai, Sucuri, Incapsula, ModSecurity, Imperva, F5 BIG-IP,
 
 ---
 
-## JS Analysis
-
-For every page crawled, ParamSpecter:
-
-1. Fetches all `<script src=...>` files
-2. Scans all inline `<script>` blocks
-3. Follows dynamic imports: `import("./chunk.js")`, `require.ensure(["./mod"])`, webpack `__webpack_require__.p + "chunk.js"` patterns
-4. Extracts API endpoint paths matching `/api/`, `/v1/`, `/graphql/`, `/admin/`, etc.
-5. Scans for secrets using 10 credential patterns
-6. Extracts JS variable assignments where the variable name suggests credentials
-7. Identifies source map references (`.map` files which often contain original source)
-8. Flags JWTs found anywhere in the JS
-
-When `--playwright` is active, XHR and `fetch()` calls made by the page after load are intercepted at the network layer and added to the crawl queue — these are API endpoints that would be invisible to static JS analysis.
-
----
-
-## Rate Limiting
-
-ParamSpecter uses a **TokenBucket per target host** to enforce a configurable request rate, not just a concurrency cap.
-
-- Default rate: `threads × 0.8` requests/second per host
-- Burst capacity: `rate × 2` (allows short bursts without throttling normal browsing patterns)
-- Automatic 429 handling: reads `Retry-After` header and waits the specified time (capped at 60s)
-- The host bucket dictionary is bounded to 512 entries with LRU eviction to prevent memory growth on crawls that touch many external domains
-
----
-
 ## Output Files
 
-All files are written atomically (temp file → rename) so a Ctrl+C or kill signal mid-write never produces a truncated or corrupt file.
+All files are written atomically (temp file → rename). A Ctrl+C mid-write never produces a truncated or corrupt file.
 
 | File | Contents |
 |---|---|
 | `<pfx>.json` | Full scan: all pages, meta summary, secrets, dir hits, param hits, subdomain hits |
 | `<pfx>.csv` | Per-page flat CSV: URL, status, title, technologies, emails, params, forms, headers |
+| `<pfx>_report.html` | Self-contained dark-theme HTML summary report |
 | `<pfx>_dirs.csv` | Directory / file hunt hits: URL, status, size, redirect |
 | `<pfx>_params.csv` | Interesting parameters: param name, payload, status delta, size delta, reflected flag |
 | `<pfx>_secrets.csv` | Extracted secrets: type, value (truncated at 80 chars), source URL |
 | `<pfx>_subdomains.csv` | Subdomains: FQDN, IPs, discovery method, HTTP status, title |
 | `<pfx>_targets.txt` | All parameterised URLs — nuclei-ready (`--export-targets` only) |
 | `<pfx>_sqlmap_targets.txt` | Injectable-looking subset — sqlmap-ready (`--export-targets` only) |
-
-The JSON file includes an `"interrupted": true` flag if the scan was stopped early with Ctrl+C.
+| `<pfx>_checkpoint.txt` | Visited URLs for `--resume` (auto-saved every 50 pages) |
 
 `<pfx>` = `paramspecter_<domain>_<YYYYMMDD_HHMMSS>`
+
+All files land in `--output-dir` (default: current directory).
 
 ---
 
 ## Architecture
 
 ```
-ParamSpecter v4.3
-├── TokenBucket          Per-host token-bucket rate limiter (req/s enforcement)
+ParamSpecter v5.0
+├── TokenBucket          Per-host token-bucket rate limiter (--rate-limit)
 ├── CrawlQueue           BFS / DFS / Priority queue
 ├── RobotsTxtHandler     robots.txt parsing + sitemap URL extraction
 ├── JSAnalyzer           External JS + inline blocks + dynamic chunk following
@@ -521,14 +591,18 @@ ParamSpecter v4.3
 ├── SubdomainHunter      DNS brute-force + crt.sh + DNS records + HTTP probe (pooled)
 ├── DirectoryHunter      Wildcard detection (5 probes + stddev) + recursive enumeration
 ├── DeepFuzzCheck        Base class for per-category vulnerability checks
-│   ├── SQLiCheck        Error-based + time-based blind SQL injection
-│   ├── XSSCheck         Reflected XSS detection
-│   ├── PathTraversalCheck  LFI / path traversal content matching
-│   ├── SSRFCheck        Cloud metadata endpoint probing
-│   └── OpenRedirectCheck   Location header + meta-refresh redirect detection
-├── ParamFuzzer          Baseline comparison + smart-fuzz + deep-fuzz orchestration
+│   ├── SQLiCheck            Error-based + time-based blind SQL injection
+│   ├── XSSCheck             Reflected XSS detection
+│   ├── PathTraversalCheck   LFI / path traversal content matching
+│   ├── SSRFCheck            Cloud metadata endpoint probing
+│   ├── OpenRedirectCheck    Location header + meta-refresh redirect detection
+│   ├── HeaderInjectionCheck Host header injection + CRLF injection  [v5.0]
+│   └── IDORCheck            Numeric ID incrementation detection      [v5.0]
+├── ParamFuzzer          Baseline + smart-fuzz + deep-fuzz + custom payload injection
 ├── FormLoginHandler     Form login with CSRF extraction + session injection
 ├── ProxyManager         Round-robin proxy rotation
+├── save_checkpoint()    Atomic checkpoint write for --resume          [v5.0]
+├── load_scope_file()    Multi-domain scope file parser                [v5.0]
 └── ParamSpecter         Main orchestrator + Playwright lifecycle + atomic output
 ```
 
@@ -537,11 +611,12 @@ ParamSpecter v4.3
 ## Known Limitations
 
 - **Playwright falls back silently.** If a page fails to load in Playwright (timeout, JS crash), the worker falls back to a normal `requests` GET. XHR interception is skipped for that page but crawling continues.
-- **SSRF detection is reflection-only.** Blind SSRF (server makes an outbound request but does not reflect the response) requires an out-of-band collaborator — Burp Collaborator or interactsh.
-- **Form login is single-step.** Multi-step auth flows (OTP, CAPTCHA, OAuth, MFA challenge pages) are not supported.
-- **No path-scope filtering.** Crawl is bounded by domain, not by path prefix. If you want `/app/` only, disable `--follow-external` and set a shallow `--depth`.
+- **SSRF detection is reflection-only.** Blind SSRF requires an out-of-band collaborator — Burp Collaborator or interactsh.
+- **IDOR detection is heuristic.** Size deltas and status-code changes are indicators, not proof. Confirm findings manually.
+- **Form login is single-step.** Multi-step auth flows (OTP, CAPTCHA, OAuth, MFA) are not supported.
+- **No path-scope filtering.** Crawl is bounded by domain (or scope file), not by path prefix.
 - **DNS fallback.** Without `dnspython`, subdomain brute-force uses `socket.gethostbyname` which returns one A record only.
-- **Deep fuzz is not a full scanner.** It uses black-box heuristics. False negatives are possible; false positives are possible on error-prone pages. Confirm findings manually.
+- **Deep fuzz is not a full scanner.** Black-box heuristics only. False negatives are possible; confirm all findings manually.
 
 ---
 
