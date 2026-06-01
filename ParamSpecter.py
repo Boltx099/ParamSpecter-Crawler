@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ParamSpecter v5.0 -- Advanced Recon Crawler
+ParamSpecter v6.0 -- Advanced Recon Crawler
 Advanced Web Crawler for Security Research & Bug Bounty
 For authorized and educational use ONLY.
 
@@ -11,15 +11,17 @@ Modes:
   subdomain -- DNS brute-force + cert transparency subdomain enumeration
   full      -- All phases combined
 
-New in v5.0:
-  - Header Injection : Host header injection + CRLF injection checks
-  - IDOR Check       : Numeric ID parameter incrementation detection
-  - Scope file       : --scope-file for multi-domain/CIDR scoping
-  - Rate limit CLI   : --rate-limit flag (requests/sec per host)
-  - Resume support   : --resume / --resume-file for interrupted scans
-  - Output dir       : --output-dir flag for all saved files
-  - HTML report      : self-contained HTML summary report
-  - Custom payloads  : --payload-file for deep-fuzz custom payloads
+New in v6.0:
+  - Retry with exponential backoff on transient errors (ConnectionReset, 503, 429)
+  - Input validation & sanitisation on URL and file arguments
+  - Configurable output verbosity (--quiet / --verbose)
+  - Per-phase timing & request-rate telemetry in the summary
+  - OpenAPI / Swagger endpoint auto-discovery during crawl
+  - robots.txt sitemap depth cap to prevent infinite sitemap chains
+  - tqdm progress bars for fuzz, param, and subdomain phases
+  - JSONL streaming writes (never buffer the full results list in RAM)
+  - CWE cross-reference on deep-fuzz findings
+  - Graceful degrade when optional deps (playwright, dnspython, tqdm) absent
 """
 
 import requests, re, sys, json, csv, time, os, argparse
@@ -44,6 +46,21 @@ try:
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
+
+try:
+    from tqdm import tqdm as _tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
+
+# -----------------------------------------------------------------
+#  VERBOSITY LEVEL  (set once in main(), read everywhere)
+# -----------------------------------------------------------------
+class _Verbosity:
+    level: int = 1   # 0=quiet, 1=normal, 2=verbose
+
+VERBOSITY = _Verbosity()
 
 
 # -----------------------------------------------------------------
@@ -78,7 +95,7 @@ def status_color(code):
 # -----------------------------------------------------------------
 
 _SPIDER_ART = [
-    '                        /\\  .-"""-.  /\\',
+    '                        /\\  .-"""-  /\\',
     '                       //\\\\/  ,,,  \\//\\\\',
     '                       |/\\| ,;;;;;, |/\\|',
     '                       //\\\\\\;-"""-;///\\\\',
@@ -103,7 +120,7 @@ BANNER = (
     "\n" +
     "\n".join(_SPIDER_ART) + "\n" +
     C.RESET +
-    C.GRAY  + "\n  ParamSpecter v5.0 -- Advanced Recon Crawler | Security Edition\n" +
+    C.GRAY  + "\n  ParamSpecter v6.0 -- Advanced Recon Crawler | Security Edition\n" +
     C.BOLD  + C.CYAN + "  Created by Boltx\n" +
     C.RED   + "─" * 90 + C.RESET + "\n"
 )
@@ -139,6 +156,59 @@ SKIP_EXTENSIONS = {
     ".woff", ".woff2", ".ttf", ".eot", ".otf",
     ".exe", ".dll", ".so", ".bin",
 }
+
+# HTTP status codes that are transient / server-side and worth retrying
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+# -----------------------------------------------------------------
+#  INPUT VALIDATION
+# -----------------------------------------------------------------
+def validate_url(url: str) -> str:
+    """
+    Validate that *url* is an absolute HTTP/HTTPS URL.
+    Raises SystemExit with a clear message on failure.
+    """
+    try:
+        p = urlparse(url)
+    except Exception:
+        print(col(f"  [!] Invalid URL: {url!r}", C.RED))
+        sys.exit(1)
+    if p.scheme not in ("http", "https"):
+        print(col(f"  [!] URL must begin with http:// or https://, got: {url!r}", C.RED))
+        sys.exit(1)
+    if not p.netloc:
+        print(col(f"  [!] URL has no host: {url!r}", C.RED))
+        sys.exit(1)
+    return url
+
+
+def validate_file_arg(path: Optional[str], label: str) -> Optional[str]:
+    """Return *path* if it exists and is readable, else exit with an error."""
+    if path is None:
+        return None
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        print(col(f"  [!] {label} not found: {path}", C.RED))
+        sys.exit(1)
+    if not os.access(path, os.R_OK):
+        print(col(f"  [!] {label} is not readable: {path}", C.RED))
+        sys.exit(1)
+    return path
+
+
+def validate_output_dir(path: str) -> str:
+    """Create *path* if it doesn't exist; exit if it cannot be created or is not writable."""
+    path = os.path.expanduser(path)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        print(col(f"  [!] Cannot create output directory {path!r}: {e}", C.RED))
+        sys.exit(1)
+    if not os.access(path, os.W_OK):
+        print(col(f"  [!] Output directory is not writable: {path}", C.RED))
+        sys.exit(1)
+    return path
 
 
 # -----------------------------------------------------------------
@@ -207,7 +277,6 @@ BUILTIN_EXTENSIONS = ["", ".php", ".html", ".asp", ".aspx", ".jsp",
                       ".json", ".xml", ".txt", ".bak", ".old", ".config",
                       ".yml", ".yaml", ".env"]
 
-# Subdomain wordlist
 BUILTIN_SUBDOMAINS = [
     "www","mail","ftp","smtp","pop","imap","webmail","remote","vpn","ssh",
     "dev","development","staging","test","testing","uat","qa","sandbox","demo",
@@ -257,14 +326,16 @@ PATTERNS = {
     "subdomain":   re.compile(r"https?://([a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)+)", re.I),
     "comment":     re.compile(r"<!--(.*?)-->", re.DOTALL),
     "js_src":      re.compile(r'<script[^>]*\ssrc=["\'](.*?)["\']', re.I),
-    "js_url":      re.compile(r"""(?:['"`])(https?://[^\s'"`<>]{10,})(?:['"`])"""),
+    "js_url":      re.compile(r"""(?:['\"`])(https?://[^\s'"`<>]{10,})(?:['\"`])"""),
     "aws_key":     re.compile(r"AKIA[0-9A-Z]{16}"),
     "api_key":     re.compile(r'(?:api[_\-]?key|apikey|secret)\s*[:=]\s*["\'\\w\-]{8,}', re.I),
     "sourcemap":   re.compile(r'//# sourceMappingURL=(.+\.map)'),
-    "endpoints":   re.compile(r"""['"`](/(?:api|v\d+|admin|auth|user|graphql|rest)[^\s'"`<>]*)['"`]""", re.I),
+    "endpoints":   re.compile(r"""['\"`](/(?:api|v\d+|admin|auth|user|graphql|rest)[^\s'"`<>]*)['\"`]""", re.I),
     "jwt":         re.compile(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}'),
     "uuid":        re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I),
     "internal_ip": re.compile(r'\b(10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)\b'),
+    # NEW: OpenAPI / Swagger spec file locations often referenced in HTML
+    "openapi":     re.compile(r'(?:href|src|url)\s*=\s*["\']((?:[^"\']*/)(?:swagger|openapi)[^"\'\s]*\.(?:json|yaml))["\']', re.I),
 }
 
 SOCIAL_DOMAINS = {"facebook.com","twitter.com","x.com","linkedin.com","instagram.com",
@@ -327,6 +398,17 @@ INTERESTING_HEADER_LEAKS = [
     "X-Forwarded-For", "X-Real-IP", "X-Debug-Token",
 ]
 
+# CWE references for deep-fuzz findings (NEW in v6.0)
+_CWE_MAP: Dict[str, str] = {
+    "SQLi":            "CWE-89 (SQL Injection)",
+    "XSS":             "CWE-79 (Cross-site Scripting)",
+    "PathTraversal":   "CWE-22 (Path Traversal)",
+    "SSRF":            "CWE-918 (SSRF)",
+    "OpenRedirect":    "CWE-601 (Open Redirect)",
+    "HeaderInjection": "CWE-113 (HTTP Response Splitting)",
+    "IDOR":            "CWE-639 (IDOR)",
+}
+
 
 # -----------------------------------------------------------------
 #  LOGGING
@@ -336,19 +418,28 @@ _log_lock = threading.Lock()
 def ts():
     return col(datetime.now().strftime("%H:%M:%S"), C.GRAY)
 
-def log(prefix, msg, pcolor=C.WHITE):
+def log(prefix, msg, pcolor=C.WHITE, min_level: int = 1):
+    """Print a log line if VERBOSITY.level >= min_level."""
+    if VERBOSITY.level < min_level:
+        return
     with _log_lock:
         print(f"  {ts()}  {col(prefix, pcolor)}  {msg}")
 
 def log_section(title):
+    if VERBOSITY.level < 1:
+        return
     with _log_lock:
         print(f"\n{col('─'*60, C.RED)}")
         print(f"  {col('>> ' + title, C.BOLD+C.CYAN)}")
         print(col('─'*60, C.RED))
 
+def vlog(prefix, msg, pcolor=C.WHITE):
+    """Verbose-only log (level 2)."""
+    log(prefix, msg, pcolor, min_level=2)
+
 
 # -----------------------------------------------------------------
-#  URL HELPERS  (accuracy improvements)
+#  URL HELPERS
 # -----------------------------------------------------------------
 def normalize_url(url: str, parent: str = "") -> Optional[str]:
     """
@@ -367,20 +458,15 @@ def normalize_url(url: str, parent: str = "") -> Optional[str]:
         if p.scheme not in ("http", "https"):
             return None
 
-        # Strip fragment
         path = p.path or "/"
-        # Collapse consecutive slashes but keep leading slash
         path = re.sub(r"/{2,}", "/", path)
-        # Remove trailing slash except root
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
 
-        # Check extension
         ext = os.path.splitext(path.split("?")[0])[1].lower()
         if ext in SKIP_EXTENSIONS:
             return None
 
-        # Strip default ports
         host = p.hostname or ""
         port = p.port
         if (p.scheme == "http" and port == 80) or (p.scheme == "https" and port == 443):
@@ -390,7 +476,6 @@ def normalize_url(url: str, parent: str = "") -> Optional[str]:
         else:
             netloc = host
 
-        # Sort query params for consistent dedup
         if p.query:
             params = sorted(parse_qs(p.query, keep_blank_values=True).items())
             query = urlencode(params, doseq=True)
@@ -411,17 +496,11 @@ def is_same_domain(url: str, base_domain: str) -> bool:
         return False
 
 
-# Patterns that vary per-request but don't indicate unique content
 _VOLATILE_PATTERNS = [
-    # CSRF tokens inside HTML attribute context only
     re.compile(r"csrfmiddlewaretoken\b[^>]{0,80}value=[\"'][^\"']{10,64}[\"']", re.I),
     re.compile(r"name=[\"'](?:_token|authenticity_token|csrf_token)[\"'][^>]*value=[\"'][^\"']{10,}[\"']", re.I),
-    # Nonce/XSRF tokens in assignment context (after = or :)
-    re.compile(r"(?<=[=:\"])(?:nonce|_csrf|xsrf)[^\"\s&]{16,}", re.I),
-    # Millisecond unix timestamps only (exactly 13 digits, not part of larger number)
+    re.compile(r"(?<=[=:\"])" r"(?:nonce|_csrf|xsrf)[^\"\s&]{16,}", re.I),
     re.compile(r"(?<!\d)\d{13}(?!\d)"),
-    # Long hex hashes only inside attribute value context (after = or opening quote)
-    # This avoids stripping visible Git SHAs in page body text
     re.compile(r"(?<=[=\"'])([0-9a-f]{40,64})(?=[\"'\s&]|$)", re.I),
 ]
 
@@ -440,10 +519,7 @@ def random_ua() -> str:
 def load_wordlist(path: Optional[str], default: List[str]) -> List[str]:
     if not path:
         return default
-    path = os.path.expanduser(path)
-    if not os.path.isfile(path):
-        print(col(f"  [!] Wordlist not found: {path}", C.RED))
-        sys.exit(1)
+    path = validate_file_arg(path, "Wordlist")
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
     log("+WL", f"Loaded {col(len(words), C.BOLD)} words from {col(path, C.CYAN)}", C.GREEN)
@@ -455,6 +531,16 @@ def load_wordlist(path: Optional[str], default: List[str]) -> List[str]:
 # -----------------------------------------------------------------
 def fetch_with_retry(session, url, method="GET", data=None, max_retries=3,
                      timeout=10, rotate_ua=False, proxies=None, **kwargs):
+    """
+    Send an HTTP request with exponential back-off retry.
+
+    Retries on:
+      - Network-level exceptions (ConnectionError, Timeout, ConnectionReset)
+      - HTTP 429, 500, 502, 503, 504 (transient server errors)
+
+    Respects the Retry-After header on 429 responses.
+    Returns (response, None) on success, (None, error_string) on exhausted retries.
+    """
     headers = {}
     if rotate_ua:
         headers["User-Agent"] = random_ua()
@@ -465,11 +551,13 @@ def fetch_with_retry(session, url, method="GET", data=None, max_retries=3,
                 method, url, data=data, headers=headers,
                 timeout=timeout, proxies=proxies, **kwargs
             )
-            # 429 Too Many Requests -- honour Retry-After before retrying
-            if resp.status_code == 429 and attempt < max_retries:
+            # Transient server errors -- retry with back-off
+            if resp.status_code in _RETRYABLE_STATUS and attempt < max_retries:
                 retry_after = float(resp.headers.get("Retry-After", delay * 2))
                 retry_after = min(retry_after, 60)
+                vlog("RETRY", f"HTTP {resp.status_code} on {url[:60]}, waiting {retry_after:.1f}s", C.YELLOW)
                 time.sleep(retry_after)
+                delay = min(delay * 2, 30)
                 continue
             return resp, None
         except requests.exceptions.ConnectionError as e:
@@ -482,6 +570,7 @@ def fetch_with_retry(session, url, method="GET", data=None, max_retries=3,
             err = str(e)
         if attempt < max_retries:
             jitter = random.uniform(0, 0.3) * delay
+            vlog("RETRY", f"Attempt {attempt+1}/{max_retries} failed for {url[:60]}: {err}", C.YELLOW)
             time.sleep(delay + jitter)
             delay = min(delay * 2, 30)
     return None, err
@@ -490,8 +579,6 @@ def fetch_with_retry(session, url, method="GET", data=None, max_retries=3,
 # -----------------------------------------------------------------
 #  PLAYWRIGHT FETCH  (per-thread context, XHR interception)
 # -----------------------------------------------------------------
-# Thread-local storage: each worker thread gets its own browser context
-# so Playwright's non-thread-safe Page objects are never shared.
 _pw_local = threading.local()
 
 def _get_thread_context(pw_browser):
@@ -507,18 +594,9 @@ def _get_thread_context(pw_browser):
 def fetch_with_playwright(pw_browser, url, timeout=10, xhr_queue=None):
     """
     Fetch *url* using a headless Chromium page owned by the calling thread.
-
-    Args:
-        pw_browser:  A Playwright Browser object (shared, but each thread
-                     gets its own BrowserContext via _get_thread_context).
-        url:         Target URL.
-        timeout:     Page-load timeout in seconds.
-        xhr_queue:   Optional list; discovered XHR/fetch API endpoint URLs
-                     are appended here so the caller can enqueue them.
-
-    Returns:
-        (html: str, final_url: str) on success, or raises PlaywrightError /
-        Exception on failure.
+    Each thread gets its own BrowserContext via _get_thread_context.
+    Intercepted XHR/fetch URLs are appended to xhr_queue if provided.
+    Returns (html, final_url) or raises on failure.
     """
     ctx = _get_thread_context(pw_browser)
     page = ctx.new_page()
@@ -528,7 +606,6 @@ def fetch_with_playwright(pw_browser, url, timeout=10, xhr_queue=None):
         rtype = request.resource_type
         if rtype in ("xhr", "fetch"):
             req_url = request.url
-            # Only capture same-origin or API-looking paths
             parsed = urlparse(req_url)
             if parsed.path and len(parsed.path) > 1:
                 intercepted.append(req_url)
@@ -552,6 +629,9 @@ def fetch_with_playwright(pw_browser, url, timeout=10, xhr_queue=None):
 #  ROBOTS.TXT + SITEMAP
 # -----------------------------------------------------------------
 class RobotsTxtHandler:
+    # Cap how many sitemap hops we follow to prevent sitemap-index loops
+    _SITEMAP_DEPTH_LIMIT = 3
+
     def __init__(self, base_url, ua, session):
         self.rp = RobotFileParser()
         self.ua = ua
@@ -587,13 +667,29 @@ class RobotsTxtHandler:
         except Exception:
             return True
 
-    def extract_sitemap_urls(self, session) -> List[str]:
-        urls = []
+    def extract_sitemap_urls(self, session, depth: int = 0) -> List[str]:
+        """
+        Recursively follow sitemap-index files up to _SITEMAP_DEPTH_LIMIT levels.
+        Returns a flat list of page <loc> URLs.
+        """
+        if depth > self._SITEMAP_DEPTH_LIMIT:
+            return []
+        urls: List[str] = []
         for sm in self.sitemaps:
             try:
                 resp, _ = fetch_with_retry(session, sm, timeout=10)
-                if resp and resp.status_code == 200:
-                    found = re.findall(r"<loc>(.*?)</loc>", resp.text, re.I)
+                if not resp or resp.status_code != 200:
+                    continue
+                text = resp.text
+                # Sitemap index: contains <sitemap><loc> entries
+                nested = re.findall(r"<sitemap>\s*<loc>(.*?)</loc>", text, re.I | re.S)
+                if nested and depth < self._SITEMAP_DEPTH_LIMIT:
+                    old_sitemaps = self.sitemaps
+                    self.sitemaps = nested
+                    urls.extend(self.extract_sitemap_urls(session, depth + 1))
+                    self.sitemaps = old_sitemaps
+                else:
+                    found = re.findall(r"<loc>(.*?)</loc>", text, re.I)
                     urls.extend(found)
             except Exception:
                 pass
@@ -605,20 +701,18 @@ class RobotsTxtHandler:
 # -----------------------------------------------------------------
 class JSAnalyzer:
     EP_PATTERN = re.compile(
-        r"""['"` ](/(?:api|v\d+|admin|auth|user|account|graphql|rest|internal|hidden|debug|config|manage)[^\s'"` <>]*)['"` ]""",
+        r"""['"`](/(?:api|v\d+|admin|auth|user|account|graphql|rest|internal|hidden|debug|config|manage)[^\s'"`<>]*)['"`]""",
         re.I
     )
     INTERESTING_VARS = re.compile(
         r"""(?:const|let|var)\s+(\w+)\s*=\s*['"`]([^'"`\n]{6,})['"`]""", re.I
     )
-    # Dynamic import patterns: import("./chunk"), require.ensure(["./mod"]),
-    # webpack publicPath + chunk filenames from __webpack_require__
     DYNAMIC_IMPORT_PATTERNS = [
         re.compile(r'import\s*\(\s*["\x27]([^"\x27]+\.js[^"\x27]*)["\x27]\s*\)', re.I),
         re.compile(r'require\.ensure\s*\(\s*\[([^\]]+)\]', re.I),
         re.compile(r'chunkFilename\s*:\s*["\x27]([^"\x27]+)["\x27]', re.I),
         re.compile(r'__webpack_require__\.p\s*\+\s*["\x27]([^"\x27]+\.js)["\x27]', re.I),
-        re.compile(r'["\x27]([/.][\w./-]+\.chunk\.js)["\x27]', re.I),
+        re.compile(r'["\x27]([/.][\\w./-]+\.chunk\.js)["\x27]', re.I),
     ]
 
     def __init__(self, session, rotate_ua=False):
@@ -631,19 +725,15 @@ class JSAnalyzer:
         secrets: List[Dict] = []
         sourcemaps: List[str] = []
 
-        # Analyze inline <script> blocks first (no HTTP request needed)
         for inline_text in (inline_scripts or []):
             self._scan_js(inline_text, page_url, endpoints, secrets, sourcemaps)
 
-        # Track which JS files we have already fetched to avoid loops
         fetched_js: Set[str] = set()
-        # Queue of JS URLs to fetch (seeded from explicit src= list)
         js_queue: List[str] = list(js_src_list)
 
         while js_queue:
             js_url = js_queue.pop(0)
             full_url = urljoin(page_url, js_url)
-            # Normalise to avoid re-fetching the same file via different relative paths
             norm = full_url.split("?")[0].split("#")[0]
             if norm in fetched_js:
                 continue
@@ -657,11 +747,9 @@ class JSAnalyzer:
             text = resp.text
             self._scan_js(text, full_url, endpoints, secrets, sourcemaps)
 
-            # Discover additional JS chunks referenced dynamically
             for pat in self.DYNAMIC_IMPORT_PATTERNS:
                 for m in pat.finditer(text):
                     chunk_path = m.group(1)
-                    # Skip data URIs and absolute external URLs
                     if chunk_path.startswith("data:") or (
                         chunk_path.startswith("http") and
                         urlparse(chunk_path).netloc != urlparse(page_url).netloc
@@ -720,9 +808,9 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
         "cookies": {}, "security_headers": {}, "leaked_headers": {},
         "captcha_detected": False, "interesting": [],
         "internal_paths": [],
+        "openapi_specs": [],   # NEW in v6.0
     }
 
-    # Meta
     if soup:
         t = soup.find("title")
         if t:
@@ -734,19 +822,16 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
         if mr:
             data["meta_robots"] = mr.get("content", "")
 
-    # Security headers
     for h in SECURITY_HEADERS:
         v = resp.headers.get(h)
         if v:
             data["security_headers"][h] = v
 
-    # Leaked headers
     for h in INTERESTING_HEADER_LEAKS:
         v = resp.headers.get(h)
         if v:
             data["leaked_headers"][h] = v
 
-    # Cookies
     for ck in resp.cookies:
         flags = []
         if not ck.has_nonstandard_attr("HttpOnly"):
@@ -757,13 +842,11 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
             flags.append("NO_SAMESITE")
         data["cookies"][ck.name] = {"value": ck.value[:40], "flags": flags}
 
-    # Links -- improved: skip anchor-only, mailto, tel, javascript hrefs
     if soup:
         base_domain = urlparse(url).netloc
         seen_links: Set[str] = set()
         for tag in soup.find_all("a", href=True):
             raw_href = tag["href"].strip()
-            # skip non-navigable hrefs
             if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
                 continue
             norm = normalize_url(raw_href, url)
@@ -778,7 +861,6 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
                 if any(sd in norm for sd in SOCIAL_DOMAINS):
                     data["social_links"].append(norm)
 
-    # Pattern extraction
     data["emails"]        = list(set(PATTERNS["email"].findall(raw_html)))
     data["phones"]        = list(set(PATTERNS["phone"].findall(raw_html)))
     data["ips"]           = list(set(PATTERNS["ipv4"].findall(raw_html)))
@@ -788,19 +870,21 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
     data["js_urls"]       = list(set(PATTERNS["js_url"].findall(raw_html)))
     data["html_comments"] = [c.strip() for c in PATTERNS["comment"].findall(raw_html) if c.strip()]
 
-    # Captcha detection
+    # NEW: OpenAPI / Swagger spec discovery
+    data["openapi_specs"] = list(set(
+        urljoin(url, m) for m in PATTERNS["openapi"].findall(raw_html)
+    ))
+
     combined = raw_html + str(resp.headers)
     for cp in CAPTCHA_PATTERNS:
         if cp.search(combined):
             data["captcha_detected"] = True
             break
 
-    # Internal paths
     data["internal_paths"] = list(set(re.findall(
         r'(?:src|href|action|data-url|data-src)=["\']([^"\'<>]{2,})["\']', raw_html
     )))
 
-    # Forms
     if soup:
         for form in soup.find_all("form"):
             inputs = [
@@ -822,26 +906,22 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
             })
             data["input_fields"].extend(inputs)
 
-    # URL params -- deduplicated across all links
     param_set: Set[str] = set()
     for u in [url] + data["links"] + data["external_links"]:
         for k in parse_qs(urlparse(u).query, keep_blank_values=True):
             param_set.add(k)
     data["params"] = sorted(param_set)
 
-    # Technology fingerprinting
     check_text = raw_html + str(resp.headers)
     for tech, sigs in TECH_SIGNATURES.items():
         if any(s.search(check_text) for s in sigs):
             data["technologies"].append(tech)
 
-    # WAF fingerprinting
     waf_text = str(resp.headers) + raw_html[:3000]
     for waf_name, sig in WAF_SIGNATURES.items():
         if sig.search(waf_text):
             data["waf"].append(waf_name)
 
-    # Extract inline <script> block content for analysis
     inline_scripts: List[str] = []
     if soup:
         for tag in soup.find_all("script", src=False):
@@ -849,20 +929,17 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
             if txt and len(txt.strip()) > 20:
                 inline_scripts.append(txt)
 
-    # JS analysis -- covers both external src files and inline blocks
     ep, sec, sm = js_analyzer.analyze(data["js_src"], url, inline_scripts)
     data["js_endpoints"] = sorted(ep)
     data["js_secrets"]   = sec
     data["sourcemaps"]   = sm
 
-    # Inline secret scanning
     for pat, label in SECRET_PATTERNS:
         for m in pat.finditer(raw_html):
             val = m.group(1) if m.lastindex else m.group(0)
             if len(val) > 6:
                 data["js_secrets"].append({"type": label, "value": val[:80], "source": url})
 
-    # Interesting
     if data["internal_ips"]:
         data["interesting"].append(f"Internal IPs: {data['internal_ips']}")
     if data["js_secrets"]:
@@ -873,6 +950,8 @@ def analyze_page(url: str, resp, soup, raw_html: str, js_analyzer: JSAnalyzer) -
         data["interesting"].append(f"{len(data['html_comments'])} HTML comment(s)")
     if data["captcha_detected"]:
         data["interesting"].append("CAPTCHA detected")
+    if data["openapi_specs"]:
+        data["interesting"].append(f"OpenAPI spec(s) found: {data['openapi_specs']}")
     for cookie_name, cookie_info in data["cookies"].items():
         if cookie_info["flags"]:
             data["interesting"].append(f"Cookie '{cookie_name}' missing flags: {cookie_info['flags']}")
@@ -903,7 +982,6 @@ class CrawlQueue:
             self._q.put(item)
 
     def get(self, timeout=3):
-        # BUG FIX: always call get() once; unwrap priority tuple afterwards
         raw = self._q.get(timeout=timeout)
         if self.strategy == "priority":
             return raw[1]
@@ -926,17 +1004,17 @@ class TokenBucket:
     """
     Classic token-bucket rate limiter.
     Allows `rate` tokens per second with a burst capacity of `capacity`.
-    Thread-safe. Used to enforce per-host request rates.
+    Thread-safe.
     """
     def __init__(self, rate: float, capacity: float = None):
-        self.rate     = rate              # tokens added per second
-        self.capacity = capacity or rate  # max burst
+        self.rate     = rate
+        self.capacity = capacity or rate
         self._tokens  = self.capacity
         self._last    = time.monotonic()
         self._lock    = threading.Lock()
 
     def acquire(self, timeout: float = 30.0) -> bool:
-        """Block until a token is available or timeout expires. Returns True on success."""
+        """Block until a token is available or timeout expires."""
         deadline = time.monotonic() + timeout
         while True:
             with self._lock:
@@ -953,8 +1031,6 @@ class TokenBucket:
             time.sleep(wait)
 
 
-# Maximum number of per-host buckets to keep in memory.
-# Hosts beyond this limit share the oldest evicted bucket (LRU-ish).
 _HOST_BUCKET_LIMIT = 512
 
 
@@ -992,16 +1068,27 @@ class CrawlStats:
     param_hits:       int = 0
     subdomains_found: int = 0
     dir_hits:         int = 0
+    requests_sent:    int = 0       # NEW: total HTTP requests (all phases)
     status_codes:     Dict[int, int] = field(default_factory=lambda: defaultdict(int))
     start_time:       datetime = field(default_factory=datetime.now)
+    # Per-phase timing (NEW in v6.0)
+    phase_times:      Dict[str, float] = field(default_factory=dict)
 
     def elapsed(self) -> str:
         secs = int((datetime.now() - self.start_time).total_seconds())
         return f"{secs // 60}m{secs % 60}s"
 
+    def avg_rps(self) -> str:
+        """Average requests per second over the whole scan."""
+        secs = max(1, int((datetime.now() - self.start_time).total_seconds()))
+        return f"{self.requests_sent / secs:.1f}"
+
+    def record_phase(self, name: str, elapsed_s: float) -> None:
+        self.phase_times[name] = round(elapsed_s, 1)
+
 
 # -----------------------------------------------------------------
-#  SUBDOMAIN HUNTER  (v4.0 new feature)
+#  SUBDOMAIN HUNTER
 # -----------------------------------------------------------------
 class SubdomainHunter:
     """
@@ -1026,7 +1113,6 @@ class SubdomainHunter:
         self._found: Dict[str, Dict] = {}
         self._lock = threading.Lock()
 
-    # -- DNS brute-force --
     def _resolve(self, fqdn: str) -> Optional[List[str]]:
         try:
             if DNS_AVAILABLE:
@@ -1038,7 +1124,8 @@ class SubdomainHunter:
         except Exception:
             return None
 
-    def _brute_worker(self, q: queue.Queue, total: int, done_counter: List[int]):
+    def _brute_worker(self, q: queue.Queue, total: int, done_counter: List[int],
+                      pbar=None):
         while not self.stop_event.is_set():
             try:
                 word = q.get(timeout=1)
@@ -1050,6 +1137,8 @@ class SubdomainHunter:
                 with self._lock:
                     done_counter[0] += 1
                     pct = int(done_counter[0] / total * 100)
+                if pbar:
+                    pbar.update(1)
                 if ips:
                     entry = {"subdomain": fqdn, "ips": ips, "method": "brute-force", "status": None}
                     with self._lock:
@@ -1060,7 +1149,7 @@ class SubdomainHunter:
                                 f"{col('->', C.GRAY)}  {col(', '.join(ips), C.GREEN)}",
                                 C.GREEN)
             except Exception as e:
-                log("SUB", col(f"Worker error: {e}", C.RED), C.RED)
+                vlog("SUB", col(f"Worker error: {e}", C.RED), C.RED)
             finally:
                 q.task_done()
 
@@ -1068,7 +1157,6 @@ class SubdomainHunter:
         log_section("SUBDOMAIN BRUTE-FORCE")
         log("SUB", f"Wordlist: {col(len(self.wordlist), C.BOLD)} entries against {col(self.domain, C.CYAN)}", C.CYAN)
 
-        # Wildcard detection -- resolves a random non-existent name
         wildcard_ip = self._resolve(f"this-should-not-exist-12345.{self.domain}")
         if wildcard_ip:
             log("SUB", col(f"WARNING: Wildcard DNS detected ({wildcard_ip}) -- results may include false positives", C.YELLOW), C.YELLOW)
@@ -1079,15 +1167,21 @@ class SubdomainHunter:
         total = q.qsize()
         done_counter = [0]
 
+        pbar = None
+        if TQDM_AVAILABLE and VERBOSITY.level >= 1:
+            pbar = _tqdm(total=total, desc="Subdomains", unit="word",
+                         leave=False, dynamic_ncols=True)
+
         workers = [
-            threading.Thread(target=self._brute_worker, args=(q, total, done_counter), daemon=True)
+            threading.Thread(target=self._brute_worker, args=(q, total, done_counter, pbar), daemon=True)
             for _ in range(min(self.threads, total or 1))
         ]
         for w in workers:
             w.start()
         q.join()
+        if pbar:
+            pbar.close()
 
-    # -- Certificate Transparency --
     def _run_crtsh(self):
         log_section("CERT TRANSPARENCY (crt.sh)")
         url = self.CRTSH_URL.format(domain=self.domain)
@@ -1119,7 +1213,6 @@ class SubdomainHunter:
         except Exception as e:
             log("CRT", col(f"Error: {e}", C.RED), C.RED)
 
-    # -- DNS record types --
     def _run_dns_records(self):
         if not DNS_AVAILABLE:
             log("DNS", col("dnspython not installed -- skipping DNS record enumeration", C.YELLOW), C.YELLOW)
@@ -1134,7 +1227,6 @@ class SubdomainHunter:
             except Exception:
                 pass
 
-    # -- HTTP probe discovered subdomains --
     def _probe_http(self):
         log_section("HTTP PROBE ON DISCOVERED SUBDOMAINS")
         items = list(self._found.values())
@@ -1167,7 +1259,6 @@ class SubdomainHunter:
                         C.CYAN)
                     break
 
-        # Cap probe threads -- spawning one thread per subdomain is unsafe at scale
         probe_threads = min(50, len(items))
         probe_q: queue.Queue = queue.Queue()
         for entry in items:
@@ -1211,17 +1302,12 @@ class SubdomainHunter:
 
 
 # -----------------------------------------------------------------
-#  DIRECTORY HUNTER  (v4.0 new feature)
+#  DIRECTORY HUNTER
 # -----------------------------------------------------------------
 class DirectoryHunter:
     """
-    Accurate directory and file enumeration with:
-    - Wildcard / soft-404 detection (baseline comparison)
-    - Response size deduplication (catches catch-all pages)
-    - Configurable match/hide status codes
-    - Recursive mode (enumerate discovered directories)
-    - Extension probing per word
-    - Thread-safe hit accumulation
+    Accurate directory and file enumeration with wildcard/soft-404 detection,
+    response-size deduplication, recursive mode, and optional progress bars.
     """
 
     def __init__(self, base_url: str, wordlist: List[str], extensions: List[str],
@@ -1250,20 +1336,11 @@ class DirectoryHunter:
         self._lock       = threading.Lock()
         self._hits: List[Dict] = []
         self._seen_urls: Set[str] = set()
-
-        # For soft-404/wildcard detection
         self._baseline_len: int = 0
         self._baseline_stdev: int = 0
         self._wildcard: bool = False
 
-    # -- Baseline / wildcard --
     def _detect_wildcard(self):
-        """
-        Send 5 random non-existent path probes.
-        If at least 4 return non-404, we have a wildcard/catch-all.
-        Use mean + 2*stdev as the threshold so natural size variation
-        does not cause false-positive filtering.
-        """
         prefixes = ["ps_wc1", "ps_wc2", "ps_wc3", "ps_wc4", "ps_wc5"]
         sizes = []
         for pfx in prefixes:
@@ -1277,7 +1354,6 @@ class DirectoryHunter:
         if len(sizes) >= 4:
             self._wildcard = True
             self._baseline_len = int(statistics.mean(sizes))
-            # stdev threshold: responses within mean +/- 2*stdev are wildcard
             self._baseline_stdev = int(statistics.stdev(sizes)) if len(sizes) > 1 else 50
             log("DIR", col(
                 f"Wildcard detected ({len(sizes)}/5 probes hit) "
@@ -1290,18 +1366,13 @@ class DirectoryHunter:
     def _is_wildcard_response(self, size: int) -> bool:
         if not self._wildcard or self._baseline_len == 0:
             return False
-        # If stdev is 0 (all responses identical, or fired simultaneously),
-        # use 3% of the baseline size as the threshold but at least 32B.
-        # This is tighter than the old flat 100B floor and avoids false
-        # positives on small catch-all pages (e.g. a 50B "not found" JSON).
         if self._baseline_stdev == 0:
             threshold = max(32, int(self._baseline_len * 0.03))
         else:
             threshold = max(32, self._baseline_stdev * 2)
         return abs(size - self._baseline_len) < threshold
 
-    # -- Worker --
-    def _worker(self, q: queue.Queue, total: int, done_ctr: List[int]):
+    def _worker(self, q: queue.Queue, total: int, done_ctr: List[int], pbar=None):
         while not self.stop_event.is_set():
             try:
                 url = q.get(timeout=1)
@@ -1317,6 +1388,9 @@ class DirectoryHunter:
                 with self._lock:
                     done_ctr[0] += 1
                     pct = int(done_ctr[0] / total * 100)
+
+                if pbar:
+                    pbar.update(1)
 
                 if resp:
                     code = resp.status_code
@@ -1352,7 +1426,7 @@ class DirectoryHunter:
                             self._hits.append(hit)
                             self.hits_out.append(hit)
             except Exception as e:
-                log("DIR", col(f"Worker error: {e}", C.RED), C.RED)
+                vlog("DIR", col(f"Worker error: {e}", C.RED), C.RED)
             finally:
                 time.sleep(self.delay)
                 q.task_done()
@@ -1375,21 +1449,27 @@ class DirectoryHunter:
             q.put(p)
 
         done_ctr = [0]
+        pbar = None
+        if TQDM_AVAILABLE and VERBOSITY.level >= 1:
+            pbar = _tqdm(total=total, desc=f"Dir [{depth}]", unit="path",
+                         leave=False, dynamic_ncols=True)
+
         workers = [
-            threading.Thread(target=self._worker, args=(q, total, done_ctr), daemon=True)
+            threading.Thread(target=self._worker, args=(q, total, done_ctr, pbar), daemon=True)
             for _ in range(min(self.threads, total or 1))
         ]
         for w in workers:
             w.start()
         q.join()
+        if pbar:
+            pbar.close()
 
-        # Recursive: go into discovered directories
         if self.recursive and depth < self.max_depth and not self.stop_event.is_set():
             with self._lock:
                 new_dirs = [
                     h["url"] for h in self._hits
                     if h["status"] in (200, 301, 302, 403)
-                    and not os.path.splitext(urlparse(h["url"]).path)[1]  # no extension = directory
+                    and not os.path.splitext(urlparse(h["url"]).path)[1]
                     and h["url"] != base
                 ]
             for nd in new_dirs:
@@ -1412,22 +1492,11 @@ class DirectoryHunter:
 #  PARAMETER FUZZER
 # -----------------------------------------------------------------
 class DeepFuzzCheck:
-    """
-    Encapsulates one vulnerability category for --deep-fuzz.
-
-    Each subclass defines:
-      PAYLOADS  – list of strings to inject
-      SEVERITY  – "HIGH" | "MEDIUM" | "LOW"
-      LABEL     – short category name shown in output
-
-    And implements:
-      detect(payload, resp, elapsed_s) -> (triggered: bool, evidence: str)
-    """
+    """Base class for deep-fuzz vulnerability checks."""
     PAYLOADS: List[str] = []
     SEVERITY: str = "LOW"
     LABEL:    str = "GENERIC"
 
-    # Colour map used when printing findings
     _SEV_COLOR: Dict[str, str] = {
         "HIGH":   C.RED + C.BOLD,
         "MEDIUM": C.YELLOW + C.BOLD,
@@ -1440,17 +1509,11 @@ class DeepFuzzCheck:
     def severity_col(self) -> str:
         return col(f"[{self.SEVERITY}]", self._SEV_COLOR.get(self.SEVERITY, C.WHITE))
 
+    def cwe(self) -> str:
+        return _CWE_MAP.get(self.LABEL, "")
+
 
 class SQLiCheck(DeepFuzzCheck):
-    """
-    SQL injection — error-based and time-based blind detection.
-
-    Time-based payloads use SLEEP(3) / pg_sleep(3) / WAITFOR DELAY.
-    All payloads share the same 6-second timeout so a legitimate
-    3-second sleep won't be mis-classed as a network error.
-
-    Error keywords cover MySQL, PostgreSQL, Oracle, MSSQL, and SQLite.
-    """
     LABEL    = "SQLi"
     SEVERITY = "HIGH"
     PAYLOADS = [
@@ -1462,10 +1525,8 @@ class SQLiCheck(DeepFuzzCheck):
         "' AND 1=CONVERT(int,(SELECT TOP 1 name FROM sysobjects))--",
     ]
 
-    # Time-based payloads: response time >= this threshold flags as blind SQLi
     TIME_THRESHOLD_S: float = 3.0
 
-    # DB error fragments – deliberately lowercase for case-insensitive matching
     ERROR_PATTERNS = re.compile(
         r"sql syntax|syntax error|mysql_fetch|ora-\d{4,5}|pg_query|"
         r"unclosed quotation|sqlite_|microsoft ole db|"
@@ -1475,34 +1536,20 @@ class SQLiCheck(DeepFuzzCheck):
         re.I,
     )
 
-    # Payloads that carry a deliberate sleep; used to flag time-based blind
     _SLEEP_RE = re.compile(r"sleep\s*\(|pg_sleep|waitfor\s+delay", re.I)
 
     def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
         body = resp.text if resp else ""
-
-        # Time-based blind: only flag if the payload actually contains a sleep call
         if elapsed_s >= self.TIME_THRESHOLD_S and self._SLEEP_RE.search(payload):
             return True, f"response time {elapsed_s:.1f}s >= {self.TIME_THRESHOLD_S}s (time-based blind)"
-
-        # Error-based
         m = self.ERROR_PATTERNS.search(body)
         if m:
             snippet = body[max(0, m.start()-20):m.end()+40].replace("\n", " ").strip()
             return True, f"DB error keyword: «{snippet[:120]}»"
-
         return False, ""
 
 
 class XSSCheck(DeepFuzzCheck):
-    """
-    Cross-site scripting — reflection detection.
-
-    We check that the *raw, unencoded* payload appears in the response
-    body, which is sufficient to flag a potential reflected XSS.  We
-    deliberately avoid URL-encoding the angle brackets so that a server
-    that HTML-encodes them produces no false positive.
-    """
     LABEL    = "XSS"
     SEVERITY = "HIGH"
     PAYLOADS = [
@@ -1512,7 +1559,6 @@ class XSSCheck(DeepFuzzCheck):
         "'><svg onload=alert(1)>",
     ]
 
-    # Minimum fragment that must appear verbatim to count as reflected
     _MARKERS: List[str] = [
         "<script>alert(1)</script>",
         "onerror=alert(1)",
@@ -1526,7 +1572,6 @@ class XSSCheck(DeepFuzzCheck):
         body = resp.text
         for marker in self._MARKERS:
             if marker in payload and marker in body:
-                # Verify the surrounding context: find where the marker appears
                 idx = body.find(marker)
                 snippet = body[max(0, idx-15):idx+len(marker)+15].replace("\n", " ")
                 return True, f"payload reflected unencoded: «{snippet[:120]}»"
@@ -1534,11 +1579,6 @@ class XSSCheck(DeepFuzzCheck):
 
 
 class PathTraversalCheck(DeepFuzzCheck):
-    """
-    Path traversal / LFI — looks for Unix passwd content or boot-loader
-    markers that only appear if the server returned /etc/passwd or
-    /boot/grub/grub.cfg respectively.
-    """
     LABEL    = "PathTraversal"
     SEVERITY = "HIGH"
     PAYLOADS = [
@@ -1547,14 +1587,14 @@ class PathTraversalCheck(DeepFuzzCheck):
         "....//....//....//etc/passwd",
         "%252e%252e%252fetc%252fpasswd",
         "../../../etc/shadow",
-        "..\\..\\..\\windows\\win.ini",
+        "..\\..\\..\\" "windows\\win.ini",
     ]
 
     _TRIGGERS = re.compile(
-        r"root:.*:/bin/(?:bash|sh|nologin)|"   # /etc/passwd line
-        r"\[boot loader\]|"                     # win.ini / boot.ini
-        r"\[extensions\]|"                      # win.ini sections
-        r"daemon:x:\d+",                        # /etc/passwd daemon line
+        r"root:.*:/bin/(?:bash|sh|nologin)|"
+        r"\[boot loader\]|"
+        r"\[extensions\]|"
+        r"daemon:x:\d+",
         re.I,
     )
 
@@ -1569,32 +1609,23 @@ class PathTraversalCheck(DeepFuzzCheck):
 
 
 class SSRFCheck(DeepFuzzCheck):
-    """
-    Server-Side Request Forgery — uses cloud metadata endpoints as
-    canary targets.  Flags if the response body contains strings that
-    only appear in real cloud metadata responses.
-
-    Note: this is a black-box heuristic.  A real SSRF may silently
-    proxy the request without reflecting it; for that, use an
-    out-of-band collaborator (Burp Collaborator / interactsh).
-    """
     LABEL    = "SSRF"
     SEVERITY = "HIGH"
     PAYLOADS = [
-        "http://169.254.169.254/latest/meta-data/",          # AWS IMDSv1
+        "http://169.254.169.254/latest/meta-data/",
         "http://169.254.169.254/latest/meta-data/ami-id",
-        "http://metadata.google.internal/computeMetadata/v1/",  # GCP
-        "http://169.254.169.254/metadata/instance?api-version=2021-02-01",  # Azure
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
     ]
 
     _TRIGGERS = re.compile(
-        r"ami-[0-9a-f]{8,17}|"                 # AWS AMI id
-        r"instance-id|"                         # AWS / GCP / Azure
-        r"placement/availability-zone|"         # AWS AZ
-        r"iam/security-credentials|"            # AWS IAM
-        r"computeMetadata|"                     # GCP header echo
-        r'"compute":\s*\{|'                     # Azure instance JSON
-        r"latest/meta-data",                    # generic AWS echo
+        r"ami-[0-9a-f]{8,17}|"
+        r"instance-id|"
+        r"placement/availability-zone|"
+        r"iam/security-credentials|"
+        r"computeMetadata|"
+        r'"compute":\s*\{|'
+        r"latest/meta-data",
         re.I,
     )
 
@@ -1609,30 +1640,20 @@ class SSRFCheck(DeepFuzzCheck):
 
 
 class OpenRedirectCheck(DeepFuzzCheck):
-    """
-    Open redirect — sends an absolute URL as the parameter value and
-    checks whether the server's Location header (or meta-refresh target)
-    points to that external domain.
-
-    We use allow_redirects=False so we can inspect the raw Location
-    header before any following redirect eats it.
-    """
     LABEL    = "OpenRedirect"
     SEVERITY = "MEDIUM"
 
-    # Canary domain — clearly external, distinct from any real target
     _CANARY = "https://evil.paramspecter.test"
 
     PAYLOADS = [
         _CANARY,
-        f"//{_CANARY.split('//')[1]}",     # protocol-relative
-        f"////{_CANARY.split('//')[1]}",   # ///// bypass
+        f"//{_CANARY.split('//')[1]}",
+        f"////{_CANARY.split('//')[1]}",
         f"https:////{_CANARY.split('//')[1]}",
     ]
 
-    _CANARY_HOST = urlparse(_CANARY).netloc  # "evil.paramspecter.test"
+    _CANARY_HOST = urlparse(_CANARY).netloc
 
-    # meta-refresh pattern
     _META_RE = re.compile(
         r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+url=([^\s"\'>;]+)',
         re.I,
@@ -1641,45 +1662,25 @@ class OpenRedirectCheck(DeepFuzzCheck):
     def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
         if not resp:
             return False, ""
-
-        # 1. Location header redirect
         loc = resp.headers.get("Location", "")
         if loc and self._CANARY_HOST in loc:
             return True, f"Location header redirects to canary: {loc[:120]}"
-
-        # 2. meta-refresh redirect in body
         m = self._META_RE.search(resp.text)
         if m and self._CANARY_HOST in m.group(1):
             return True, f"meta-refresh redirects to canary: {m.group(1)[:120]}"
-
         return False, ""
 
 
 class HeaderInjectionCheck(DeepFuzzCheck):
-    """
-    HTTP Header Injection — Host header injection and CRLF injection.
-
-    Host header injection: sends a spoofed Host header and checks if
-    the response body or Location header reflects it (password reset
-    poisoning, cache poisoning).
-
-    CRLF injection: injects CR+LF into a parameter value and checks
-    if the injected string appears as a new response header, which
-    indicates the server is echoing raw input into its header stream.
-    """
     LABEL    = "HeaderInjection"
     SEVERITY = "HIGH"
 
     _CANARY_HOST = "evil.paramspecter.test"
 
     PAYLOADS = [
-        # Host header injection canary
         f"host_inject:{_CANARY_HOST}",
-        # CRLF via URL-encoded CR+LF
         "crlf_inject:%0d%0aX-Injected-Header:paramspecter",
-        # CRLF via raw newline in value
         "crlf_inject:\r\nX-Injected-Header:paramspecter",
-        # Double-encoded CRLF
         "crlf_inject:%250d%250aX-Injected-Header:paramspecter",
     ]
 
@@ -1688,9 +1689,7 @@ class HeaderInjectionCheck(DeepFuzzCheck):
     def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
         if not resp:
             return False, ""
-
         if payload.startswith("host_inject:"):
-            # Check if canary host appears in body or Location
             body = resp.text
             loc  = resp.headers.get("Location", "")
             if self._CANARY_HOST in body:
@@ -1699,24 +1698,15 @@ class HeaderInjectionCheck(DeepFuzzCheck):
                 return True, f"Host header reflected in body: «{snippet[:120]}»"
             if self._CANARY_HOST in loc:
                 return True, f"Host header reflected in Location: {loc[:120]}"
-
         elif "crlf_inject:" in payload:
-            # Check for injected header appearing in response headers
             if self._CRLF_MARKER in resp.headers:
                 return True, f"CRLF injection: '{self._CRLF_MARKER}' appeared in response headers"
-            # Also check body in case server echoes headers back
             if self._CRLF_MARKER in resp.text:
                 return True, f"CRLF injection marker reflected in response body"
-
         return False, ""
 
     def send_custom(self, session, target_url: str, param: str,
                     timeout: int, rotate_ua: bool, proxies) -> Tuple[bool, str]:
-        """
-        Override the normal param-value injection for Host header test:
-        sends the request with a spoofed Host header instead of
-        injecting into a query parameter.
-        """
         headers = {"Host": self._CANARY_HOST}
         if rotate_ua:
             headers["User-Agent"] = random_ua()
@@ -1731,26 +1721,10 @@ class HeaderInjectionCheck(DeepFuzzCheck):
 
 
 class IDORCheck(DeepFuzzCheck):
-    """
-    Insecure Direct Object Reference (IDOR) — numeric ID probing.
-
-    For each parameter carrying a numeric value, sends requests with
-    id+1, id-1, id+100, and id=0.  Flags when:
-      - The response size differs significantly from the baseline
-        (different record returned)
-      - The response status differs (403 → 200 = access control bypass)
-      - Response body contains a different user/account identifier
-
-    Note: only fires on parameters whose baseline value is numeric.
-    Non-numeric params are skipped silently.
-    """
     LABEL    = "IDOR"
     SEVERITY = "HIGH"
-
-    # Placeholder; actual payloads are computed per-param from the numeric value
     PAYLOADS = ["__idor_probe__"]
 
-    # Patterns that suggest a record was returned with different owner data
     _OWNER_PATTERNS = re.compile(
         r'"(?:user(?:name|_?id)?|email|account|owner|author)"'
         r'\s*:\s*"([^"]{3,})"',
@@ -1758,27 +1732,18 @@ class IDORCheck(DeepFuzzCheck):
     )
 
     def detect(self, payload: str, resp, elapsed_s: float) -> Tuple[bool, str]:
-        # Generic detect — real logic is in probe_idor(); this is a stub.
         return False, ""
 
     def probe_idor(self, session, target_url: str, param: str,
                    baseline_val: str, baseline_size: int, baseline_code: int,
                    timeout: int, rotate_ua: bool, proxies) -> List[Tuple[bool, str, str]]:
-        """
-        Returns list of (triggered, evidence, tested_value) tuples.
-        """
         try:
             base_int = int(baseline_val)
         except (ValueError, TypeError):
-            return []  # not numeric — skip
+            return []
 
         findings = []
-        probes = [
-            base_int + 1,
-            base_int - 1,
-            base_int + 100,
-            0,
-        ]
+        probes = [base_int + 1, base_int - 1, base_int + 100, 0]
         for probe_val in probes:
             if probe_val < 0:
                 continue
@@ -1790,8 +1755,6 @@ class IDORCheck(DeepFuzzCheck):
                                    proxies=proxies, allow_redirects=True)
                 code = resp.status_code
                 size = len(resp.content)
-
-                # Status-code change (e.g., 403 → 200)
                 if code != baseline_code and code == 200:
                     findings.append((
                         True,
@@ -1799,10 +1762,7 @@ class IDORCheck(DeepFuzzCheck):
                         str(probe_val),
                     ))
                     continue
-
-                # Significant size delta on a 200
                 if code == 200 and abs(size - baseline_size) > 200:
-                    # Check for different owner fields in JSON
                     m = self._OWNER_PATTERNS.search(resp.text)
                     evidence = (
                         f"Different record returned for id={probe_val} "
@@ -1811,10 +1771,8 @@ class IDORCheck(DeepFuzzCheck):
                         + ")"
                     )
                     findings.append((True, evidence, str(probe_val)))
-
             except Exception:
                 pass
-
         return findings
 
 
@@ -1824,25 +1782,11 @@ class IDORCheck(DeepFuzzCheck):
 def load_payload_file(path: Optional[str]) -> Dict[str, List[str]]:
     """
     Load a custom payload file for --deep-fuzz.
-
-    Format (one entry per line):
-        CHECK_LABEL:payload string
-
-    Example:
-        SQLi:' OR SLEEP(5)--
-        XSS:<img src=x onerror=alert(document.domain)>
-        PathTraversal:../../../../etc/shadow
-
-    Lines starting with # are comments.  Unknown labels are ignored
-    with a warning.  Returns a dict mapping label -> list of payloads.
+    Format: LABEL:payload  (one per line, # = comment)
     """
     if not path:
         return {}
-    path = os.path.expanduser(path)
-    if not os.path.isfile(path):
-        print(col(f"  [!] Payload file not found: {path}", C.RED))
-        sys.exit(1)
-
+    path = validate_file_arg(path, "Payload file")
     known_labels = {"SQLi", "XSS", "PathTraversal", "SSRF",
                     "OpenRedirect", "HeaderInjection", "IDOR"}
     result: Dict[str, List[str]] = defaultdict(list)
@@ -1852,12 +1796,12 @@ def load_payload_file(path: Optional[str]) -> Dict[str, List[str]]:
             if not line or line.startswith("#"):
                 continue
             if ":" not in line:
-                print(col(f"  [!] payload file line {lineno}: missing label prefix, skipped", C.YELLOW))
+                log("PLOAD", col(f"line {lineno}: missing label prefix, skipped", C.YELLOW), C.YELLOW)
                 continue
             label, payload = line.split(":", 1)
             label = label.strip()
             if label not in known_labels:
-                print(col(f"  [!] payload file line {lineno}: unknown label '{label}', skipped", C.YELLOW))
+                log("PLOAD", col(f"line {lineno}: unknown label '{label}', skipped", C.YELLOW), C.YELLOW)
                 continue
             result[label].append(payload)
 
@@ -1897,18 +1841,9 @@ def load_checkpoint(path: str) -> Set[str]:
 #  SCOPE HELPERS
 # -----------------------------------------------------------------
 def load_scope_file(path: Optional[str]) -> List[str]:
-    """
-    Load a scope file — one entry per line, either:
-      - A domain / subdomain  (e.g. example.com, *.example.com)
-      - A CIDR block          (e.g. 192.168.1.0/24)   [stored as-is for now]
-    Lines starting with # are comments.
-    """
     if not path:
         return []
-    path = os.path.expanduser(path)
-    if not os.path.isfile(path):
-        print(col(f"  [!] Scope file not found: {path}", C.RED))
-        sys.exit(1)
+    path = validate_file_arg(path, "Scope file")
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         entries = [l.strip() for l in f if l.strip() and not l.startswith("#")]
     log("+SC", f"Loaded {col(len(entries), C.BOLD)} scope entries from {col(path, C.CYAN)}", C.GREEN)
@@ -1916,11 +1851,6 @@ def load_scope_file(path: Optional[str]) -> List[str]:
 
 
 def url_in_scope(url: str, scope_entries: List[str], base_domain: str) -> bool:
-    """
-    Return True if url is within scope.
-    scope_entries is empty → fall back to same-domain check vs base_domain.
-    Supports wildcard prefixes: *.example.com matches sub.example.com.
-    """
     if not scope_entries:
         return is_same_domain(url, base_domain)
     try:
@@ -1934,7 +1864,7 @@ def url_in_scope(url: str, scope_entries: List[str], base_domain: str) -> bool:
     return False
 
 
-# Registry: order determines the output order in the summary
+# Deep-fuzz check registry
 _DEEP_FUZZ_CHECKS: List[DeepFuzzCheck] = [
     SQLiCheck(),
     XSSCheck(),
@@ -1949,25 +1879,7 @@ _DEEP_FUZZ_CHECKS: List[DeepFuzzCheck] = [
 class ParamFuzzer:
     """
     Wordlist-based parameter discovery and vulnerability fuzzing.
-
-    Modes
-    -----
-    Default (no flags)
-        One probe per parameter: checks for status-code change,
-        response-size delta, and value reflection.
-
-    --smart-fuzz
-        Runs all 6 built-in FUZZ_VALUES per parameter (SQLi, XSS,
-        traversal, template injection, etc.) with the same
-        interesting-heuristic as the default mode.
-
-    --deep-fuzz  (new)
-        After the basic smart-fuzz pass, runs every DeepFuzzCheck
-        category against every parameter.  Each category has its own
-        payload list, detection logic, and severity label.  Findings
-        are printed immediately and accumulated in self._deep_hits.
-        --deep-fuzz implicitly enables --smart-fuzz behaviour (the
-        baseline pass always runs first).
+    Supports normal, --smart-fuzz, and --deep-fuzz modes.
     """
 
     FUZZ_VALUES = [
@@ -1979,8 +1891,6 @@ class ParamFuzzer:
         "{{7*7}}",
     ]
 
-    # Extra timeout headroom for time-based payloads (seconds added on top
-    # of self.timeout when a sleep-carrying payload is being sent)
     _SLEEP_EXTRA_TIMEOUT = 8
 
     def __init__(self, target_url, param_list, threads, timeout, session,
@@ -1999,7 +1909,7 @@ class ParamFuzzer:
         self.method         = method.upper()
         self.rotate_ua      = rotate_ua
         self.proxy_mgr      = proxy_mgr
-        self.smart_fuzz     = smart_fuzz or deep_fuzz  # deep implies smart
+        self.smart_fuzz     = smart_fuzz or deep_fuzz
         self.deep_fuzz      = deep_fuzz
         self.custom_payloads = custom_payloads or {}
         self._q             = queue.Queue()
@@ -2010,9 +1920,6 @@ class ParamFuzzer:
         self._base_code = 0
         self._base_len  = 0
 
-    # ------------------------------------------------------------------
-    # Baseline
-    # ------------------------------------------------------------------
     def _baseline(self):
         resp, _ = fetch_with_retry(self.session, self.target_url, timeout=self.timeout)
         if resp:
@@ -2022,13 +1929,9 @@ class ParamFuzzer:
         else:
             log("PARAM", "Baseline failed", C.RED)
 
-    # ------------------------------------------------------------------
-    # Orchestration
-    # ------------------------------------------------------------------
     def run(self):
         self._baseline()
 
-        # ---- standard / smart-fuzz pass ----
         fuzz_vals = self.FUZZ_VALUES if self.smart_fuzz else [self.FUZZ_VALUES[0]]
         tasks = [(p.strip(), v) for p in self.param_list for v in fuzz_vals]
         total = len(tasks)
@@ -2048,7 +1951,6 @@ class ParamFuzzer:
             w.start()
         self._q.join()
 
-        # ---- deep-fuzz pass ----
         if self.deep_fuzz and not self.stop_event.is_set():
             self._run_deep_fuzz()
 
@@ -2064,9 +1966,6 @@ class ParamFuzzer:
 
         return self._hits
 
-    # ------------------------------------------------------------------
-    # Standard worker
-    # ------------------------------------------------------------------
     def _worker(self, total: int):
         while not self.stop_event.is_set():
             try:
@@ -2110,10 +2009,6 @@ class ParamFuzzer:
                             reasons.append(f"delta-size:{diff}B")
                         if reflected:
                             reasons.append("REFLECTED")
-                        flag = col("* INTERESTING " + " ".join(reasons), C.GREEN+C.BOLD)
-                        log(f"PARAM {pct:>3}%",
-                            f"{status_color(code)}  "
-                            f"{col('?'+param+'='+fuzz_val[:20], C.YELLOW)}  {flag}", C.CYAN)
                         hit = {
                             "param": param, "payload": fuzz_val,
                             "url": self.target_url, "status": code,
@@ -2121,36 +2016,29 @@ class ParamFuzzer:
                             "reflected": reflected, "interesting": True
                         }
                         with self._lock:
-                            self._hits.append(hit)
-                            self.hits_out.append(hit)
+                            dedup_key = (param, fuzz_val)
+                            already = any(
+                                (h["param"], h["payload"]) == dedup_key
+                                for h in self._hits
+                            )
+                            if not already:
+                                self._hits.append(hit)
+                                self.hits_out.append(hit)
+                                flag = col("* INTERESTING " + " ".join(reasons), C.GREEN+C.BOLD)
+                                log(f"PARAM {pct:>3}%",
+                                    f"{status_color(code)}  "
+                                    f"{col('?'+param+'='+fuzz_val[:20], C.YELLOW)}  {flag}", C.CYAN)
             except Exception as e:
-                log("PARAM", col(f"Worker error: {e}", C.RED), C.RED)
+                vlog("PARAM", col(f"Worker error: {e}", C.RED), C.RED)
             finally:
                 time.sleep(self.delay)
                 self._q.task_done()
 
-    # ------------------------------------------------------------------
-    # Deep-fuzz pass
-    # ------------------------------------------------------------------
     def _run_deep_fuzz(self):
-        """
-        Iterate every (param, check, payload) triple sequentially inside
-        a thread pool.  Sequential-per-param ordering keeps the output
-        readable; the thread pool keeps wall-clock time manageable when
-        many parameters are being tested.
-
-        Time-based payloads get an extended per-request timeout so a
-        legitimate 3-second SLEEP doesn't time-out before we can observe
-        the delay.
-
-        Custom payloads from --payload-file are merged into each check's
-        payload list before building the triple list.
-        """
         log_section("DEEP FUZZ  (SQLi / XSS / PathTraversal / SSRF / OpenRedirect / HeaderInjection / IDOR)")
 
         params = [p.strip() for p in self.param_list]
 
-        # Merge custom payloads into each check
         active_checks = list(_DEEP_FUZZ_CHECKS)
         if self.custom_payloads:
             for check in active_checks:
@@ -2159,13 +2047,10 @@ class ParamFuzzer:
                     check.PAYLOADS = list(check.PAYLOADS) + extras
                     log("DEEP", f"Added {col(len(extras), C.BOLD)} custom payload(s) to {col(check.LABEL, C.MAGENTA)}", C.MAGENTA)
 
-        # Build (param, check, payload) triples —
-        # IDOR and HeaderInjection use special probing logic, skip normal triples for them
         triples: List[Tuple[str, DeepFuzzCheck, str]] = []
         for param in params:
             for check in active_checks:
                 if isinstance(check, (IDORCheck, HeaderInjectionCheck)):
-                    # Add one sentinel triple per param; handled specially in _probe_deep
                     triples.append((param, check, "__special__"))
                 else:
                     for payload in check.PAYLOADS:
@@ -2192,7 +2077,7 @@ class ParamFuzzer:
                 try:
                     self._probe_deep(param, check, payload, total, done_counter)
                 except Exception as e:
-                    log("DEEP", col(f"Worker error [{check.LABEL}] {param}: {e}", C.RED), C.RED)
+                    vlog("DEEP", col(f"Worker error [{check.LABEL}] {param}: {e}", C.RED), C.RED)
                 finally:
                     time.sleep(self.delay)
                     dq.task_done()
@@ -2205,38 +2090,29 @@ class ParamFuzzer:
             w.start()
         dq.join()
 
-        # ---- summary table ----
         if self._deep_hits:
             log_section(f"DEEP FUZZ FINDINGS  ({len(self._deep_hits)} total)")
             for h in self._deep_hits:
                 sev_str = col(f"[{h['severity']}]",
                               DeepFuzzCheck._SEV_COLOR.get(h['severity'], C.WHITE))
+                cwe_str = col(f"  [{h.get('cwe', '')}]", C.GRAY) if h.get("cwe") else ""
                 print(
                     f"  {ts()}  {sev_str}"
                     f"  {col(h['check'], C.MAGENTA)}"
                     f"  param={col(h['param'], C.YELLOW)}"
-                    f"  payload={col(repr(h['payload'][:40]), C.WHITE)}\n"
+                    f"  payload={col(repr(h['payload'][:40]), C.WHITE)}{cwe_str}\n"
                     f"  {' '*12}evidence: {col(h['evidence'], C.RED)}"
                 )
         else:
             log("DEEP", col("No deep-fuzz findings.", C.GRAY), C.GRAY)
 
-    def _probe_deep(
-        self,
-        param: str,
-        check: DeepFuzzCheck,
-        payload: str,
-        total: int,
-        done_counter: List[int],
-    ) -> None:
-        """Send one (param, payload) probe and run the appropriate detector."""
+    def _probe_deep(self, param, check, payload, total, done_counter):
         proxies = self.proxy_mgr.next() if self.proxy_mgr else None
 
         with self._lock:
             done_counter[0] += 1
             pct = int(done_counter[0] / total * 100)
 
-        # ---- HeaderInjection: special probing via send_custom ----
         if isinstance(check, HeaderInjectionCheck) and payload == "__special__":
             triggered, evidence = check.send_custom(
                 self.session, self.target_url, param,
@@ -2244,7 +2120,6 @@ class ParamFuzzer:
             )
             if triggered:
                 self._record_deep_hit(check, param, "Host-header-inject", evidence, None, 0, pct)
-            # Also run CRLF payloads normally
             for crlf_payload in [p for p in HeaderInjectionCheck.PAYLOADS if "crlf_inject:" in p]:
                 sep = "&" if "?" in self.target_url else "?"
                 url = f"{self.target_url}{sep}{param}={quote(crlf_payload)}"
@@ -2258,9 +2133,7 @@ class ParamFuzzer:
                     pass
             return
 
-        # ---- IDOR: special probing via probe_idor ----
         if isinstance(check, IDORCheck) and payload == "__special__":
-            # Get baseline value for this param from the URL
             qs = parse_qs(urlparse(self.target_url).query, keep_blank_values=True)
             baseline_val = (qs.get(param) or ["1"])[0]
             findings = check.probe_idor(
@@ -2273,7 +2146,6 @@ class ParamFuzzer:
                     self._record_deep_hit(check, param, tested_val, evidence, None, 0, pct)
             return
 
-        # ---- Standard probe ----
         _sleep_re = re.compile(r"sleep\s*\(|pg_sleep|waitfor\s+delay", re.I)
         req_timeout = (
             self.timeout + self._SLEEP_EXTRA_TIMEOUT
@@ -2281,7 +2153,6 @@ class ParamFuzzer:
             else self.timeout
         )
 
-        # Open-redirect probes must NOT follow redirects so we can inspect Location
         follow = not isinstance(check, OpenRedirectCheck)
 
         t_start = time.monotonic()
@@ -2308,15 +2179,15 @@ class ParamFuzzer:
             self._record_deep_hit(check, param, payload, evidence, resp, elapsed, pct)
         else:
             if done_counter[0] % max(1, total // 40) == 0:
-                log(f"DEEP {pct:>3}%",
-                    f"{col(check.LABEL, C.GRAY)}  {col(param, C.GRAY)}",
-                    C.GRAY)
+                vlog(f"DEEP {pct:>3}%",
+                     f"{col(check.LABEL, C.GRAY)}  {col(param, C.GRAY)}",
+                     C.GRAY)
 
     def _record_deep_hit(self, check, param, payload, evidence, resp, elapsed, pct):
-        """Record and immediately print a deep-fuzz finding."""
         hit = {
             "check":    check.LABEL,
             "severity": check.SEVERITY,
+            "cwe":      check.cwe(),
             "param":    param,
             "payload":  payload,
             "url":      self.target_url,
@@ -2330,12 +2201,13 @@ class ParamFuzzer:
 
         sev_str = col(f"[{check.SEVERITY}]",
                       DeepFuzzCheck._SEV_COLOR.get(check.SEVERITY, C.WHITE))
+        cwe_str = col(f"  [{check.cwe()}]", C.GRAY) if check.cwe() else ""
         with _log_lock:
             print(
                 f"  {ts()}  {col(f'DEEP {pct:>3}%', C.MAGENTA)}  "
                 f"{sev_str}  {col(check.LABEL, C.MAGENTA+C.BOLD)}  "
                 f"param={col(param, C.YELLOW)}  "
-                f"payload={col(repr(str(payload)[:30]), C.WHITE)}\n"
+                f"payload={col(repr(str(payload)[:30]), C.WHITE)}{cwe_str}\n"
                 f"  {' '*12}evidence: {col(evidence[:100], C.RED)}"
             )
 
@@ -2345,27 +2217,10 @@ class ParamFuzzer:
 # -----------------------------------------------------------------
 class FormLoginHandler:
     """
-    Performs a form-based login against a target application before crawling
-    begins, injecting the resulting session cookies into the shared
-    requests.Session so all workers are authenticated from the first request.
-
-    Flow
-    ----
-    1. GET  --login-url  to fetch the login page and extract:
-         • The form's action URL (falls back to --login-url itself)
-         • The form's method (POST assumed; GET accepted)
-         • Any hidden CSRF / token / nonce fields
-    2. POST  credentials + CSRF token to the resolved action URL.
-    3. Validate the response:
-         • Non-2xx  → hard error
-         • Final URL contains the login-page path again → hard error
-           (redirect-back-to-login is the universal failure signal)
-         • "password" still in response body (heuristic) → warning
-    4. Merge all cookies from the response into the session.  The session
-       is shared across all threads so no further action is needed.
+    Automated form-based login: GETs the login page, extracts CSRF tokens,
+    POSTs credentials, injects cookies into the shared session.
     """
 
-    # Hidden-field names that are typically CSRF tokens
     CSRF_FIELD_RE = re.compile(
         r"csrf|token|nonce|_wpnonce|authenticity_token|__RequestVerificationToken",
         re.I,
@@ -2383,18 +2238,10 @@ class FormLoginHandler:
         self.pass_field = pass_field
         self.timeout    = timeout
 
-    # ------------------------------------------------------------------
-    # Public entry-point
-    # ------------------------------------------------------------------
     def login(self) -> None:
-        """
-        Execute the login sequence.  Raises ``SystemExit`` on any hard
-        failure so the caller never starts a crawl with no session.
-        """
         log_section("FORM LOGIN")
         log("AUTH", f"Fetching login page: {col(self.login_url, C.CYAN)}", C.CYAN)
 
-        # ---- Step 1: fetch the login page ----
         get_resp, err = fetch_with_retry(
             self.session, self.login_url,
             timeout=self.timeout, allow_redirects=True,
@@ -2410,12 +2257,11 @@ class FormLoginHandler:
             names = ", ".join(hidden.keys())
             log("AUTH", f"CSRF fields : {col(names, C.YELLOW)}", C.YELLOW)
 
-        # ---- Step 2: build POST payload ----
         payload: Dict[str, str] = {
             self.user_field: self.username,
             self.pass_field: self.password,
         }
-        payload.update(hidden)   # CSRF token(s) go in last so they overwrite
+        payload.update(hidden)
 
         log("AUTH",
             f"Submitting  : {col(self.user_field, C.WHITE)}=<user>  "
@@ -2439,10 +2285,8 @@ class FormLoginHandler:
         if post_resp is None:
             self._die(f"Login POST failed: {err}")
 
-        # ---- Step 3: validate ----
         self._validate(post_resp)
 
-        # ---- Step 4: report injected cookies ----
         cookie_names = [c.name for c in self.session.cookies]
         if cookie_names:
             log("AUTH",
@@ -2453,20 +2297,7 @@ class FormLoginHandler:
                 col("WARNING: No cookies received after login — session may not be established", C.YELLOW),
                 C.YELLOW)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _parse_login_form(
-        self, soup: "BeautifulSoup", page_url: str
-    ) -> Tuple[str, str, Dict[str, str]]:
-        """
-        Locate the most likely login <form> in *soup* and return
-        (action_url, method, hidden_fields).
-
-        Selection order:
-          1. A <form> containing an <input type="password">
-          2. The first <form> on the page (fallback)
-        """
+    def _parse_login_form(self, soup, page_url: str) -> Tuple[str, str, Dict[str, str]]:
         form = None
         for candidate in soup.find_all("form"):
             if candidate.find("input", {"type": "password"}):
@@ -2476,7 +2307,6 @@ class FormLoginHandler:
             form = soup.find("form")
 
         if form is None:
-            # No form found — try to POST directly to the login URL
             log("AUTH",
                 col("No <form> found on login page; will POST directly to --login-url", C.YELLOW),
                 C.YELLOW)
@@ -2486,7 +2316,6 @@ class FormLoginHandler:
         action_url = urljoin(page_url, raw_action)
         method     = form.get("method", "POST").strip()
 
-        # Collect all hidden inputs whose names look like CSRF tokens
         hidden: Dict[str, str] = {}
         for inp in form.find_all("input", {"type": "hidden"}):
             name  = inp.get("name", "").strip()
@@ -2494,8 +2323,6 @@ class FormLoginHandler:
             if name and self.CSRF_FIELD_RE.search(name):
                 hidden[name] = value
 
-        # Also grab every hidden input (non-CSRF) so we don't break
-        # multi-step forms that require all hidden fields to be echoed
         for inp in form.find_all("input", {"type": "hidden"}):
             name  = inp.get("name", "").strip()
             value = inp.get("value", "")
@@ -2505,20 +2332,13 @@ class FormLoginHandler:
         return action_url, method, hidden
 
     def _validate(self, resp: requests.Response) -> None:
-        """
-        Raise SystemExit with a clear message if the login clearly failed.
-        """
         final_url = resp.url
-
-        # 1. Non-2xx status code
         if not (200 <= resp.status_code < 300):
             self._die(
                 f"Login returned HTTP {resp.status_code} "
                 f"(expected 2xx).  Final URL: {final_url}"
             )
 
-        # 2. Redirect loop back to login page
-        #    Compare path components to avoid false positives from scheme/host diffs
         login_path  = urlparse(self.login_url).path.rstrip("/")
         final_path  = urlparse(final_url).path.rstrip("/")
         if login_path and final_path == login_path:
@@ -2530,7 +2350,6 @@ class FormLoginHandler:
                 f"  --login-user-field / --login-pass-field names are wrong."
             )
 
-        # 3. Soft warning: password field still in body (login form re-rendered)
         if resp.text and re.search(
             rf'(?:name|id)\s*=\s*["\']?{re.escape(self.pass_field)}["\']?',
             resp.text, re.I
@@ -2539,7 +2358,7 @@ class FormLoginHandler:
                 col("WARNING: Password field found in response body — login may have failed "
                     "(form re-rendered).  Check credentials and field names.", C.YELLOW),
                 C.YELLOW)
-            return   # not a hard error — some apps re-embed the form on success
+            return
 
         log("AUTH",
             col(f"Login appears successful  (HTTP {resp.status_code}, "
@@ -2576,17 +2395,11 @@ class ParamSpecter:
         self.max_retries    = getattr(args, "max_retries", 3)
         self.smart_fuzz     = getattr(args, "smart_fuzz", False)
 
-        # Output directory
-        self.output_dir = getattr(args, "output_dir", None) or "."
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.output_dir = validate_output_dir(getattr(args, "output_dir", None) or ".")
 
-        # Scope entries (from --scope-file)
         self.scope_entries: List[str] = load_scope_file(getattr(args, "scope_file", None))
-
-        # Custom payloads (from --payload-file)
         self.custom_payloads: Dict[str, List[str]] = load_payload_file(getattr(args, "payload_file", None))
 
-        # Rate limit (requests/sec per host, CLI overrides thread-based default)
         cli_rate = getattr(args, "rate_limit", None)
         self._host_rate = float(cli_rate) if cli_rate else max(1.0, self.threads * 0.8)
 
@@ -2613,7 +2426,6 @@ class ParamSpecter:
                     k, v = pair.split(":", 1)
                     self.session.headers[k.strip()] = v.strip()
 
-        # Form-based login (runs once, before any crawl worker starts)
         if getattr(args, "login_url", None):
             FormLoginHandler(
                 session     = self.session,
@@ -2625,13 +2437,11 @@ class ParamSpecter:
                 timeout     = self.timeout,
             ).login()
 
-        # Proxy manager
         proxy_list = []
         if getattr(args, "proxies", None):
             proxy_list = [p.strip() for p in args.proxies.split(",") if p.strip()]
         self.proxy_mgr = ProxyManager(proxy_list) if proxy_list else None
 
-        # Crawl state — resume from checkpoint if requested
         self._checkpoint_file = getattr(args, "resume_file", None) or \
             os.path.join(self.output_dir, f"paramspecter_{self.base_domain.replace('.','_')}_checkpoint.txt")
         _resume = getattr(args, "resume", False)
@@ -2644,7 +2454,6 @@ class ParamSpecter:
         self.results: List[Dict]      = []
         self.results_lock             = threading.Lock()
 
-        # Aggregates
         self.all_emails:     Set[str]   = set()
         self.all_phones:     Set[str]   = set()
         self.all_links:      Set[str]   = set()
@@ -2653,23 +2462,19 @@ class ParamSpecter:
         self.all_wafs:       Set[str]   = set()
         self.all_params:     Set[str]   = set()
         self.all_secrets:    List[Dict] = []
+        self.all_openapi:    Set[str]   = set()   # NEW
         self.all_forms:      int        = 0
         self.all_interesting: List[str] = []
         self.missing_sec_headers: Dict[str, int] = defaultdict(int)
 
-        # Fuzz/subdomain results
         self.fuzz_hits:      List[Dict] = []
         self.param_hits:     List[Dict] = []
         self.subdomain_hits: List[Dict] = []
         self.dir_hits:       List[Dict] = []
 
-        # Stats
         self.stats = CrawlStats()
-
-        # Shared stop event -- all phases and workers check this
         self._stop_event = threading.Event()
 
-        # Robots
         self.robots = None
         if self.respect_robots:
             log("ROBOTS", "Fetching robots.txt ...", C.CYAN)
@@ -2686,17 +2491,14 @@ class ParamSpecter:
                 self.delay = self.robots.crawl_delay
                 log("ROBOTS", f"Honoring crawl-delay: {self.delay}s", C.YELLOW)
 
-        # Per-host token-bucket rate limiters (bounded dict to prevent memory leak)
         self._host_buckets: Dict[str, TokenBucket] = {}
         self._host_buckets_lock = threading.Lock()
 
-        # JS Analyzer
         self.js_analyzer = JSAnalyzer(self.session, rotate_ua=self.rotate_ua)
 
-        # Playwright browser (shared across threads; each thread uses its own context)
         self.use_playwright = getattr(args, "playwright", False)
-        self._pw_instance   = None   # sync_playwright().__enter__() handle
-        self.pw_browser     = None   # Browser object
+        self._pw_instance   = None
+        self.pw_browser     = None
 
         if self.use_playwright:
             if not PLAYWRIGHT_AVAILABLE:
@@ -2714,25 +2516,22 @@ class ParamSpecter:
                     self._pw_instance   = None
                     self.pw_browser     = None
 
+        # JSONL streaming file handle (opened once, closed in save_results)
+        self._jsonl_fh = None
+
         signal.signal(signal.SIGINT, self._handle_sigint)
         self.start_time = datetime.now()
 
     def _host_bucket(self, url: str) -> TokenBucket:
-        """
-        Return a per-host TokenBucket, creating one if needed.
-        The dict is bounded to _HOST_BUCKET_LIMIT entries; when full,
-        the first-inserted key is evicted (dict insertion order, Python 3.7+).
-        """
         host = urlparse(url).netloc
         with self._host_buckets_lock:
             if host not in self._host_buckets:
                 if len(self._host_buckets) >= _HOST_BUCKET_LIMIT:
-                    # Evict the oldest entry (first key in insertion order)
                     evict_key = next(iter(self._host_buckets))
                     del self._host_buckets[evict_key]
                 self._host_buckets[host] = TokenBucket(
                     rate=self._host_rate,
-                    capacity=self._host_rate * 2  # allow small bursts
+                    capacity=self._host_rate * 2
                 )
             return self._host_buckets[host]
 
@@ -2759,7 +2558,6 @@ class ParamSpecter:
                     self.crawl_queue.task_done()
                     continue
                 self.visited.add(url)
-                # Periodically save checkpoint every 50 pages
                 if len(self.visited) % 50 == 0:
                     threading.Thread(
                         target=save_checkpoint,
@@ -2773,16 +2571,15 @@ class ParamSpecter:
                     break
 
             if self.robots and not self.robots.allowed(url):
-                log("SKIP", col(url, C.GRAY), C.GRAY)
+                vlog("SKIP", col(url, C.GRAY), C.GRAY)
                 self.crawl_queue.task_done()
                 continue
 
             proxies = self.proxy_mgr.next() if self.proxy_mgr else None
             bucket = self._host_bucket(url)
-            bucket.acquire()  # rate-limit per host before firing request
+            bucket.acquire()
 
-            # ---- fetch: Playwright path or requests fallback ----
-            xhr_endpoints: List[str] = []  # API URLs captured via XHR/fetch interception
+            xhr_endpoints: List[str] = []
             resp = None
             err  = None
             pw_html: Optional[str] = None
@@ -2794,15 +2591,11 @@ class ParamSpecter:
                         timeout=self.timeout,
                         xhr_queue=xhr_endpoints,
                     )
-                    # Build a lightweight mock response so the rest of the pipeline
-                    # is unchanged. We re-use requests just for the final_url HEAD
-                    # so we capture real headers/cookies; fall back to requests GET.
                     resp, err = fetch_with_retry(
                         self.session, url, timeout=self.timeout,
                         rotate_ua=self.rotate_ua, proxies=proxies,
                         max_retries=1, allow_redirects=True,
                     )
-                    # Replace the response body with the JS-rendered HTML from Playwright
                     if resp is not None and pw_html:
                         resp._content = pw_html.encode("utf-8", errors="replace")
                         resp.encoding  = "utf-8"
@@ -2820,6 +2613,10 @@ class ParamSpecter:
                     max_retries=self.max_retries, allow_redirects=True,
                 )
 
+            # Track total requests sent
+            with self.results_lock:
+                self.stats.requests_sent += 1
+
             if resp is None:
                 with self.results_lock:
                     self.results.append({"url": url, "status": None, "error": err})
@@ -2832,7 +2629,6 @@ class ParamSpecter:
 
             self.stats.status_codes[resp.status_code] += 1
 
-            # Gate on content type -- only parse HTML/text
             ct = resp.headers.get("Content-Type", "")
             raw = ""
             soup = None
@@ -2844,11 +2640,10 @@ class ParamSpecter:
                 except Exception:
                     pass
 
-            # Content dedup
             chash = content_hash(raw)
             with self.visited_lock:
                 if chash in self.visited_hashes and len(raw) > 200:
-                    log("DUPE", col(url, C.GRAY), C.GRAY)
+                    vlog("DUPE", col(url, C.GRAY), C.GRAY)
                     self.crawl_queue.task_done()
                     time.sleep(self.delay)
                     continue
@@ -2856,36 +2651,45 @@ class ParamSpecter:
 
             pd = analyze_page(url, resp, soup, raw, self.js_analyzer)
 
-            # BUG FIX: increment pages_crawled AFTER successful fetch (accurate count)
             with self.results_lock:
                 self.stats.pages_crawled += 1
                 count = self.stats.pages_crawled
 
             redir_info = f"  -> {resp.url}" if resp.history else ""
             q_depth = self.crawl_queue.qsize()
-            with _log_lock:
-                print(f"  {ts()}  {col(f'[{count:>4}]', C.CYAN)}  {status_color(resp.status_code)}  "
-                      f"{col(url[:72], C.WHITE)}{col(redir_info, C.YELLOW)}"
-                      f"  {col(f'[q:{q_depth}]', C.GRAY)}")
-                if pd.get("interesting"):
-                    for item in pd["interesting"][:3]:
-                        print(f"  {ts()}  {col('  [*] FIND', C.RED+C.BOLD)}  {col(item, C.YELLOW)}")
-                if pd["emails"]:
-                    print(f"  {ts()}  {col('     +', C.GREEN)}  Emails: {col(', '.join(pd['emails']), C.GREEN)}")
-                if pd["waf"]:
-                    print(f"  {ts()}  {col('     W', C.YELLOW)}  WAF: {col(', '.join(pd['waf']), C.YELLOW)}")
-                if pd["forms"]:
-                    print(f"  {ts()}  {col('     F', C.GRAY)}  Forms:{len(pd['forms'])} Inputs:{len(pd['input_fields'])}")
-                if pd["params"]:
-                    print(f"  {ts()}  {col('     P', C.YELLOW)}  Params: {col(str(pd['params'][:5]), C.YELLOW)}")
-                if pd["js_endpoints"]:
-                    print(f"  {ts()}  {col('     J', C.CYAN)}  JS endpoints: {len(pd['js_endpoints'])}")
-                if pd["js_secrets"]:
-                    print(f"  {ts()}  {col('     !', C.RED+C.BOLD)}  Secrets: {len(pd['js_secrets'])} possible secret(s)")
-                if pd["captcha_detected"]:
-                    print(f"  {ts()}  {col('    [C]', C.MAGENTA)}  CAPTCHA detected")
+            if VERBOSITY.level >= 1:
+                with _log_lock:
+                    print(f"  {ts()}  {col(f'[{count:>4}]', C.CYAN)}  {status_color(resp.status_code)}  "
+                          f"{col(url[:72], C.WHITE)}{col(redir_info, C.YELLOW)}"
+                          f"  {col(f'[q:{q_depth}]', C.GRAY)}")
+                    if pd.get("interesting"):
+                        for item in pd["interesting"][:3]:
+                            print(f"  {ts()}  {col('  [*] FIND', C.RED+C.BOLD)}  {col(item, C.YELLOW)}")
+                    if pd["emails"]:
+                        print(f"  {ts()}  {col('     +', C.GREEN)}  Emails: {col(', '.join(pd['emails']), C.GREEN)}")
+                    if pd["waf"]:
+                        print(f"  {ts()}  {col('     W', C.YELLOW)}  WAF: {col(', '.join(pd['waf']), C.YELLOW)}")
+                    if pd["forms"]:
+                        print(f"  {ts()}  {col('     F', C.GRAY)}  Forms:{len(pd['forms'])} Inputs:{len(pd['input_fields'])}")
+                    if pd["params"]:
+                        print(f"  {ts()}  {col('     P', C.YELLOW)}  Params: {col(str(pd['params'][:5]), C.YELLOW)}")
+                    if pd["js_endpoints"]:
+                        print(f"  {ts()}  {col('     J', C.CYAN)}  JS endpoints: {len(pd['js_endpoints'])}")
+                    if pd["js_secrets"]:
+                        print(f"  {ts()}  {col('     !', C.RED+C.BOLD)}  Secrets: {len(pd['js_secrets'])} possible secret(s)")
+                    if pd["captcha_detected"]:
+                        print(f"  {ts()}  {col('    [C]', C.MAGENTA)}  CAPTCHA detected")
+                    if pd.get("openapi_specs"):
+                        print(f"  {ts()}  {col('    [A]', C.BLUE)}  OpenAPI specs: {pd['openapi_specs']}")
 
-            # Aggregate
+            # JSONL streaming: write page record immediately (never buffer all in RAM)
+            if self._jsonl_fh is not None:
+                try:
+                    self._jsonl_fh.write(json.dumps(pd, ensure_ascii=False) + "\n")
+                    self._jsonl_fh.flush()
+                except Exception:
+                    pass
+
             with self.results_lock:
                 self.results.append(pd)
                 self.all_emails.update(pd["emails"])
@@ -2895,7 +2699,7 @@ class ParamSpecter:
                 self.all_techs.update(pd["technologies"])
                 self.all_wafs.update(pd["waf"])
                 self.all_params.update(pd["params"])
-                # Deduplicate secrets by (type, value prefix) -- keep first occurrence
+                self.all_openapi.update(pd.get("openapi_specs", []))
                 _seen_secret_keys = {
                     (s.get("type",""), s.get("value","")[:40])
                     for s in self.all_secrets
@@ -2916,7 +2720,6 @@ class ParamSpecter:
                     if sh not in pd["security_headers"]:
                         self.missing_sec_headers[sh] += 1
 
-            # Enqueue new links
             if depth < self.depth and not self._stop_event.is_set() \
                     and ("html" in mime or mime in CRAWLABLE_MIME):
                 for link in pd["links"]:
@@ -2933,7 +2736,6 @@ class ParamSpecter:
                                 self.crawl_queue.put((link, depth + 1), priority=depth + 1)
                                 self.stats.links_found += 1
 
-            # Enqueue API endpoints discovered via Playwright XHR/fetch interception
             if xhr_endpoints and not self._stop_event.is_set():
                 new_api = 0
                 for ep_url in xhr_endpoints:
@@ -2952,17 +2754,12 @@ class ParamSpecter:
                                 self.stats.links_found += 1
                                 new_api += 1
                 if new_api:
-                    log("PW", col(f"Queued {new_api} XHR/fetch endpoint(s) from {url[:60]}", C.CYAN), C.CYAN)
+                    vlog("PW", col(f"Queued {new_api} XHR/fetch endpoint(s) from {url[:60]}", C.CYAN), C.CYAN)
 
             time.sleep(self.delay)
             self.crawl_queue.task_done()
 
     def run_crawl(self):
-        # _workers_done is set once all worker threads have exited naturally.
-        # Using a Barrier of size (threads + 1) so main thread participates:
-        # each worker calls barrier.wait() on exit; main calls barrier.wait()
-        # to block until all workers are done.  This is race-free: there is no
-        # window between "queue empty" and "task_done called".
         _barrier = threading.Barrier(self.threads + 1, timeout=3600)
 
         def _worker_wrapper():
@@ -2980,11 +2777,10 @@ class ParamSpecter:
             w.start()
 
         try:
-            _barrier.wait()  # blocks until all workers have called wait()
+            _barrier.wait()
         except threading.BrokenBarrierError:
             pass
 
-        # On Ctrl+C drain the queue so task_done counts stay balanced
         if self._stop_event.is_set():
             drained = 0
             while True:
@@ -3000,7 +2796,6 @@ class ParamSpecter:
         for w in workers:
             w.join(timeout=3)
 
-    # ---- directory hunt ----
     def run_dir_hunt(self, base_url=None):
         a = self.args
         wl   = load_wordlist(getattr(a, "wordlist", None), BUILTIN_DIRS)
@@ -3018,7 +2813,6 @@ class ParamSpecter:
             recursive=recursive, max_depth=max_rdepth,
         ).run()
 
-    # ---- param fuzz ----
     def run_param_fuzz(self, target_url=None):
         a  = self.args
         pl = load_wordlist(getattr(a, "param_wordlist", None), BUILTIN_PARAMS)
@@ -3033,11 +2827,9 @@ class ParamSpecter:
             custom_payloads=self.custom_payloads,
         ).run()
 
-    # ---- subdomain hunt ----
     def run_subdomain_hunt(self):
         a  = self.args
         wl = load_wordlist(getattr(a, "sub_wordlist", None), BUILTIN_SUBDOMAINS)
-        # Extract root domain (strip leading www/subdomain for brute-force target)
         parts = self.base_domain.split(".")
         root_domain = ".".join(parts[-2:]) if len(parts) >= 2 else self.base_domain
         SubdomainHunter(
@@ -3046,21 +2838,36 @@ class ParamSpecter:
             self._stop_event,
         ).run()
 
-    # ---- orchestrate ----
     def run(self):
         mode = self.mode
 
+        # Open JSONL streaming file up-front so crawl worker can write to it
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_pfx = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
+        pfx = os.path.join(self.output_dir, base_pfx)
+        if self.output in ("jsonl",):
+            jsonl_path = f"{pfx}.jsonl"
+            try:
+                self._jsonl_fh = open(jsonl_path, "w", encoding="utf-8")
+            except OSError as e:
+                log("SAVE", col(f"Cannot open JSONL stream: {e}", C.RED), C.RED)
+
         if mode in ("crawl", "full"):
             log_section("PHASE 1 -- CRAWLING")
+            t0 = time.monotonic()
             self.run_crawl()
+            self.stats.record_phase("crawl", time.monotonic() - t0)
 
         if not self._stop_event.is_set() and mode in ("subdomain", "full"):
             log_section("PHASE 2 -- SUBDOMAIN ENUMERATION")
+            t0 = time.monotonic()
             self.run_subdomain_hunt()
             self.stats.subdomains_found = len(self.subdomain_hits)
+            self.stats.record_phase("subdomain", time.monotonic() - t0)
 
         if not self._stop_event.is_set() and mode in ("fuzz", "full"):
             log_section("PHASE 3 -- DIRECTORY HUNTING")
+            t0 = time.monotonic()
             targets = {self.start_url}
             if mode == "full" and self.results:
                 for r in self.results:
@@ -3071,9 +2878,11 @@ class ParamSpecter:
                     break
                 self.run_dir_hunt(base_url=t)
             self.stats.dir_hits = len(self.dir_hits)
+            self.stats.record_phase("fuzz", time.monotonic() - t0)
 
         if not self._stop_event.is_set() and mode in ("param", "full"):
             log_section("PHASE 4 -- PARAMETER FUZZING")
+            t0 = time.monotonic()
             targets = [self.start_url]
             if mode == "full":
                 param_urls = [r["url"] for r in self.results
@@ -3084,19 +2893,25 @@ class ParamSpecter:
                 if self._stop_event.is_set():
                     break
                 self.run_param_fuzz(target_url=t)
+            self.stats.record_phase("param", time.monotonic() - t0)
+
+        # Close JSONL stream
+        if self._jsonl_fh is not None:
+            try:
+                self._jsonl_fh.close()
+            except Exception:
+                pass
+            self._jsonl_fh = None
 
         self.print_summary()
-        self.save_results()
-        # export_targets runs after save_results so all hits are final
+        self.save_results(pfx)
         self._export_targets_paths: Tuple[str, str] = ("", "")
         if getattr(self.args, "export_targets", False):
-            self._export_targets_paths = self.export_targets()
+            self._export_targets_paths = self.export_targets(pfx)
             self._print_tool_hints()
 
-        # Shut down Playwright browser and all thread-local contexts
         if self.pw_browser is not None:
             try:
-                # Close per-thread contexts stored in _pw_local (best-effort)
                 if hasattr(_pw_local, "context") and _pw_local.context is not None:
                     _pw_local.context.close()
                     _pw_local.context = None
@@ -3109,12 +2924,7 @@ class ParamSpecter:
             except Exception:
                 pass
 
-    # ---- tool command hints ----
     def _print_tool_hints(self) -> None:
-        """
-        Print ready-to-run nuclei and sqlmap command lines after the scan.
-        Only called when --export-targets is active and both files exist.
-        """
         t_path, sql_path = self._export_targets_paths
         sep = col("─" * 65, C.YELLOW)
         print(f"\n{sep}")
@@ -3128,7 +2938,6 @@ class ParamSpecter:
             print(f"    {col(f'sqlmap -m {sql_path} --batch --dbs', C.WHITE)}")
         print(sep + "\n")
 
-    # ---- summary ----
     def print_summary(self):
         dur = self.stats.elapsed()
         interrupted = "  (INTERRUPTED)" if self._stop_event.is_set() else ""
@@ -3137,48 +2946,58 @@ class ParamSpecter:
         print(col("="*65, C.RED))
 
         rows = [
-            ("Target",           self.start_url),
-            ("Mode",             self.mode),
-            ("Strategy",         self.strategy),
-            ("Pages crawled",    self.stats.pages_crawled),
-            ("Pages failed",     self.stats.pages_failed),
-            ("Links found",      len(self.all_links)),
-            ("Emails",           len(self.all_emails)),
+            ("Target",             self.start_url),
+            ("Mode",               self.mode),
+            ("Strategy",           self.strategy),
+            ("Pages crawled",      self.stats.pages_crawled),
+            ("Pages failed",       self.stats.pages_failed),
+            ("Total requests",     self.stats.requests_sent),
+            ("Avg req/s",          self.stats.avg_rps()),
+            ("Links found",        len(self.all_links)),
+            ("Emails",             len(self.all_emails)),
             ("Subdomains (crawl)", len(self.all_subdomains)),
-            ("Subdomains (hunt)", len(self.subdomain_hits)),
-            ("URL Params",       len(self.all_params)),
-            ("Forms found",      self.all_forms),
-            ("Secrets found",    len(self.all_secrets)),
-            ("Dir hits",         len(self.dir_hits)),
-            ("Param hits",       len(self.param_hits)),
-            ("Technologies",     ", ".join(self.all_techs) or "None"),
-            ("WAF",              ", ".join(self.all_wafs)  or "None"),
-            ("Duration",         dur),
+            ("Subdomains (hunt)",  len(self.subdomain_hits)),
+            ("URL Params",         len(self.all_params)),
+            ("Forms found",        self.all_forms),
+            ("Secrets found",      len(self.all_secrets)),
+            ("OpenAPI specs",      len(self.all_openapi)),
+            ("Dir hits",           len(self.dir_hits)),
+            ("Param hits",         len(self.param_hits)),
+            ("Technologies",       ", ".join(self.all_techs) or "None"),
+            ("WAF",                ", ".join(self.all_wafs)  or "None"),
+            ("Duration",           dur),
         ]
         for label, val in rows:
             sev_col = C.RED if label in ("Secrets found", "Pages failed") and val else C.CYAN
             print(f"  {col(label + ':', sev_col):<32} {val}")
 
-        # HTTP breakdown
+        # Per-phase timing (NEW)
+        if self.stats.phase_times:
+            print(f"\n  {col('Phase Timing:', C.CYAN)}")
+            for phase, secs in self.stats.phase_times.items():
+                print(f"    {col(phase, C.WHITE):<16} {secs}s")
+
         if self.stats.status_codes:
             print(f"\n  {col('HTTP Status Breakdown:', C.CYAN)}")
             for code in sorted(self.stats.status_codes):
                 bar = "#" * min(self.stats.status_codes[code], 35)
                 print(f"    {status_color(code)}  {bar}  ({self.stats.status_codes[code]})")
 
-        # Emails
         if self.all_emails:
             print(f"\n  {col('Emails:', C.CYAN)}")
             for e in sorted(self.all_emails):
                 print(f"    {col(e, C.GREEN)}")
 
-        # Params
         if self.all_params:
             print(f"\n  {col('URL Parameters Discovered:', C.CYAN)}")
             for p in sorted(self.all_params):
                 print(f"    {col('?'+p, C.YELLOW)}")
 
-        # Secrets
+        if self.all_openapi:
+            print(f"\n  {col('OpenAPI / Swagger Specs:', C.CYAN)}")
+            for spec in sorted(self.all_openapi):
+                print(f"    {col(spec, C.BLUE)}")
+
         if self.all_secrets:
             print(f"\n  {col('[!] Possible Secrets Found:', C.RED+C.BOLD)}")
             seen_vals: Set[str] = set()
@@ -3190,7 +3009,6 @@ class ParamSpecter:
                 print(f"    {col('['+s.get('type','?')+']', C.YELLOW)}  {col(s.get('value','')[:60], C.RED)}")
                 print(f"    {col('Source: '+s.get('source',''), C.GRAY)}")
 
-        # Subdomain hits
         if self.subdomain_hits:
             print(f"\n  {col('Subdomains Found:', C.CYAN)}")
             for h in sorted(self.subdomain_hits, key=lambda x: x["subdomain"]):
@@ -3198,21 +3016,19 @@ class ParamSpecter:
                 st_str  = status_color(h.get("status")) if h.get("status") else col("no-http", C.GRAY)
                 print(f"    {col(h['subdomain'], C.CYAN):<50} {ip_str:<20} {st_str}  [{h.get('method','')}]")
 
-        # Dir hits
         if self.dir_hits:
             print(f"\n  {col('Directory / File Hits:', C.CYAN)}")
             for h in self.dir_hits:
                 print(f"    {status_color(h['status'])}  {h['url']}  [{h['size']}B]")
 
-        # Param hits
         if self.param_hits:
             print(f"\n  {col('Interesting Parameters:', C.CYAN)}")
             for h in self.param_hits:
                 refl = col(" [REFLECTED]", C.RED+C.BOLD) if h.get("reflected") else ""
+                cwe  = col(f"  [{h.get('cwe','')}]", C.GRAY) if h.get("cwe") else ""
                 print(f"    {status_color(h['status'])}  ?{col(h['param'], C.YELLOW)}"
-                      f"  delta:{h['size_diff']}B{refl}")
+                      f"  delta:{h['size_diff']}B{refl}{cwe}")
 
-        # Interesting findings
         if self.all_interesting:
             print(f"\n  {col('[*] Interesting Findings:', C.MAGENTA)}")
             seen: Set[str] = set()
@@ -3221,7 +3037,6 @@ class ParamSpecter:
                     seen.add(item)
                     print(f"    {col('-', C.YELLOW)} {item}")
 
-        # Missing security headers
         if self.missing_sec_headers:
             print(f"\n  {col('Missing Security Headers:', C.YELLOW)}")
             for h, c in sorted(self.missing_sec_headers.items(), key=lambda x: -x[1]):
@@ -3229,13 +3044,7 @@ class ParamSpecter:
 
         print(f"{col('='*65, C.RED)}\n")
 
-    # ---- save ----
-    def save_results(self):
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_pfx = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
-        pfx = os.path.join(self.output_dir, base_pfx)
-
-        # Save final checkpoint
+    def save_results(self, pfx: str):
         save_checkpoint(self._checkpoint_file, self.visited)
 
         meta = {
@@ -3244,6 +3053,9 @@ class ParamSpecter:
             "duration": self.stats.elapsed(),
             "interrupted": self._stop_event.is_set(),
             "total_pages": self.stats.pages_crawled,
+            "total_requests": self.stats.requests_sent,
+            "avg_rps": self.stats.avg_rps(),
+            "phase_times": self.stats.phase_times,
             "emails": list(self.all_emails),
             "phones": list(self.all_phones),
             "subdomains_crawl": list(self.all_subdomains),
@@ -3251,11 +3063,12 @@ class ParamSpecter:
             "technologies": list(self.all_techs),
             "waf": list(self.all_wafs),
             "params": list(self.all_params),
+            "openapi_specs": list(self.all_openapi),
             "secrets_count": len(self.all_secrets),
             "missing_security_headers": dict(self.missing_sec_headers),
         }
 
-        if self.output in ("json", "both", "jsonl"):
+        if self.output in ("json", "both"):
             fname = f"{pfx}.json"
             payload = {
                 "meta": meta,
@@ -3266,8 +3079,6 @@ class ParamSpecter:
                 "param_hits": self.param_hits,
                 "subdomain_hits": self.subdomain_hits,
             }
-            # Atomic write: write to temp file then rename so a Ctrl+C mid-write
-            # never leaves a truncated/corrupt output file
             try:
                 fd, tmp_path = tempfile.mkstemp(suffix=".json.tmp",
                                                 dir=os.path.dirname(fname) or ".")
@@ -3280,12 +3091,15 @@ class ParamSpecter:
                     json.dump(payload, f, indent=2, ensure_ascii=False)
             log("SAVED", f"JSON -> {col(fname, C.CYAN)}", C.GREEN)
 
-            if self.output == "jsonl":
-                fl = f"{pfx}.jsonl"
-                with open(fl, "w", encoding="utf-8") as f:
-                    for r in self.results:
-                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
-                log("SAVED", f"JSONL -> {col(fl, C.CYAN)}", C.GREEN)
+        if self.output == "jsonl":
+            # JSONL was streamed during crawl; write a separate meta file
+            meta_fname = f"{pfx}_meta.json"
+            try:
+                with open(meta_fname, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2, ensure_ascii=False)
+                log("SAVED", f"JSONL meta -> {col(meta_fname, C.CYAN)}", C.GREEN)
+            except Exception as e:
+                log("SAVE", col(f"Meta write failed: {e}", C.RED), C.RED)
 
         if self.output in ("csv", "both"):
             fname = f"{pfx}.csv"
@@ -3293,8 +3107,7 @@ class ParamSpecter:
                       "ips","internal_ips","subdomains","params","forms","html_comments",
                       "redirect_chain","social_links","security_headers",
                       "leaked_headers","js_endpoints","sourcemaps","captcha_detected",
-                      "content_length","content_hash"]
-            # Atomic: write to temp then rename
+                      "content_length","content_hash","openapi_specs"]
             _tmp_csv = fname + ".tmp"
             with open(_tmp_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -3303,7 +3116,7 @@ class ParamSpecter:
                     row = dict(r)
                     for k in ["emails","phones","ips","internal_ips","subdomains","params",
                               "technologies","waf","html_comments","redirect_chain",
-                              "social_links","js_endpoints","sourcemaps"]:
+                              "social_links","js_endpoints","sourcemaps","openapi_specs"]:
                         if isinstance(row.get(k), list):
                             row[k] = " | ".join(str(i) for i in row[k])
                     row["forms"] = len(r.get("forms", []))
@@ -3314,7 +3127,6 @@ class ParamSpecter:
             log("SAVED", f"CSV  -> {col(fname, C.CYAN)}", C.GREEN)
 
             def _write_csv_atomic(path, fieldnames, rows, extra_fn=None):
-                """Write CSV atomically via temp file + rename."""
                 tmp = path + ".tmp"
                 try:
                     with open(tmp, "w", newline="", encoding="utf-8") as f:
@@ -3335,43 +3147,23 @@ class ParamSpecter:
                         pass
 
             if self.dir_hits:
-                _write_csv_atomic(
-                    f"{pfx}_dirs.csv",
-                    ["url","status","size","redirect"],
-                    self.dir_hits
-                )
-
+                _write_csv_atomic(f"{pfx}_dirs.csv", ["url","status","size","redirect"], self.dir_hits)
             if self.param_hits:
-                _write_csv_atomic(
-                    f"{pfx}_params.csv",
-                    ["param","payload","url","status","size","size_diff","reflected"],
-                    self.param_hits
-                )
-
+                _write_csv_atomic(f"{pfx}_params.csv",
+                    ["param","payload","url","status","size","size_diff","reflected","cwe"], self.param_hits)
             if self.all_secrets:
-                _write_csv_atomic(
-                    f"{pfx}_secrets.csv",
-                    ["type","value","source"],
-                    self.all_secrets
-                )
-
+                _write_csv_atomic(f"{pfx}_secrets.csv", ["type","value","source"], self.all_secrets)
             if self.subdomain_hits:
                 def _fix_sub(row):
                     row["ips"] = ", ".join(row.get("ips", []) if isinstance(row.get("ips"), list) else [row.get("ips","")])
                     return row
-                _write_csv_atomic(
-                    f"{pfx}_subdomains.csv",
+                _write_csv_atomic(f"{pfx}_subdomains.csv",
                     ["subdomain","ips","method","status","http_url","title"],
-                    self.subdomain_hits,
-                    extra_fn=_fix_sub
-                )
+                    self.subdomain_hits, extra_fn=_fix_sub)
 
-        # ---- HTML report ----
         self._save_html_report(pfx)
 
-    # ---- HTML report ----
     def _save_html_report(self, pfx: str) -> None:
-        """Generate a self-contained HTML summary report."""
         html_path = f"{pfx}_report.html"
 
         def _esc(s):
@@ -3394,27 +3186,38 @@ class ParamSpecter:
                 f"<td>{_esc(s.get('source',''))}</td></tr>\n"
             )
 
-        param_hits_html = _rows(self.param_hits, ["param","url","status","size_diff","reflected","payload"])
+        param_hits_html = _rows(self.param_hits, ["param","url","status","size_diff","reflected","payload","cwe"])
         dir_hits_html   = _rows(self.dir_hits,   ["url","status","size","redirect"])
         sub_hits_html   = ""
         for h in self.subdomain_hits:
             sub_hits_html += (
                 f"<tr><td>{_esc(h.get('subdomain',''))}</td>"
-                f"<td>{_esc(', '.join(h.get('ips',[])))} </td>"
+                f"<td>{_esc(', '.join(h.get('ips',[])))}</td>"
                 f"<td>{_esc(h.get('status',''))}</td>"
                 f"<td>{_esc(h.get('method',''))}</td></tr>\n"
             )
 
+        openapi_html = ""
+        for spec in sorted(self.all_openapi):
+            openapi_html += f"<tr><td><a href='{_esc(spec)}' target='_blank' style='color:#80c8ff'>{_esc(spec)}</a></td></tr>\n"
+
         tech_badges = " ".join(f"<span class='badge badge-blue'>{_esc(t)}</span>" for t in sorted(self.all_techs))
         waf_badges  = " ".join(f"<span class='badge badge-yellow'>{_esc(w)}</span>" for w in sorted(self.all_wafs))
         param_list  = " ".join(f"<span class='badge badge-gray'>?{_esc(p)}</span>" for p in sorted(self.all_params)[:80])
+
+        phase_timing_html = ""
+        if self.stats.phase_times:
+            phase_timing_html = "<div class='section'><h2>Phase Timing</h2><table><thead><tr><th>Phase</th><th>Duration (s)</th></tr></thead><tbody>"
+            for phase, secs in self.stats.phase_times.items():
+                phase_timing_html += f"<tr><td>{_esc(phase)}</td><td>{secs}</td></tr>"
+            phase_timing_html += "</tbody></table></div>"
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ParamSpecter v5.0 Report — {_esc(self.start_url)}</title>
+<title>ParamSpecter v6.0 Report — {_esc(self.start_url)}</title>
 <style>
   :root{{--red:#e74c3c;--green:#2ecc71;--blue:#3498db;--yellow:#f39c12;--gray:#95a5a6;--dark:#1a1a2e;--card:#16213e;--text:#e0e0e0}}
   *{{box-sizing:border-box;margin:0;padding:0}}
@@ -3441,10 +3244,11 @@ class ParamSpecter:
 </style>
 </head>
 <body>
-<h1>⚡ ParamSpecter v5.0 — Scan Report</h1>
+<h1>⚡ ParamSpecter v6.0 — Scan Report</h1>
 <p class="meta">Target: <strong>{_esc(self.start_url)}</strong> &nbsp;|&nbsp;
 Mode: {_esc(self.mode)} &nbsp;|&nbsp;
 Duration: {_esc(self.stats.elapsed())} &nbsp;|&nbsp;
+Requests: {self.stats.requests_sent} ({self.stats.avg_rps()} req/s) &nbsp;|&nbsp;
 Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
 
 <div class="warn">⚠️ For authorized security testing only. Do not use against targets without explicit written permission.</div>
@@ -3458,6 +3262,8 @@ Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
   <div class="card"><div class="num">{len(self.param_hits)}</div><div class="lbl">Param Hits</div></div>
   <div class="card"><div class="num">{len(self.subdomain_hits)}</div><div class="lbl">Subdomains</div></div>
   <div class="card"><div class="num">{self.all_forms}</div><div class="lbl">Forms Found</div></div>
+  <div class="card"><div class="num">{len(self.all_openapi)}</div><div class="lbl">OpenAPI Specs</div></div>
+  <div class="card"><div class="num">{self.stats.requests_sent}</div><div class="lbl">Total Requests</div></div>
 </div>
 
 <div class="section">
@@ -3472,13 +3278,17 @@ Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
   <p>{param_list or '<span style="color:var(--gray)">None</span>'}</p>
 </div>
 
+{phase_timing_html}
+
+{"<div class='section'><h2>OpenAPI / Swagger Specs (" + str(len(self.all_openapi)) + ")</h2><table><thead><tr><th>URL</th></tr></thead><tbody>" + openapi_html + "</tbody></table></div>" if self.all_openapi else ""}
+
 {"<div class='section'><h2>⚠️ Possible Secrets (" + str(len(self.all_secrets)) + ")</h2><table><thead>" + _th(["Type","Value","Source"]) + "</thead><tbody>" + secrets_html + "</tbody></table></div>" if self.all_secrets else ""}
 
 {"<div class='section'><h2>Emails Found</h2><p>" + " ".join(f"<span class='badge badge-gray'>{_esc(e)}</span>" for e in sorted(self.all_emails)) + "</p></div>" if self.all_emails else ""}
 
 {"<div class='section'><h2>Directory / File Hits (" + str(len(self.dir_hits)) + ")</h2><table><thead>" + _th(["URL","Status","Size","Redirect"]) + "</thead><tbody>" + dir_hits_html + "</tbody></table></div>" if self.dir_hits else ""}
 
-{"<div class='section'><h2>Parameter Hits (" + str(len(self.param_hits)) + ")</h2><table><thead>" + _th(["Param","URL","Status","Size Delta","Reflected","Payload"]) + "</thead><tbody>" + param_hits_html + "</tbody></table></div>" if self.param_hits else ""}
+{"<div class='section'><h2>Parameter Hits (" + str(len(self.param_hits)) + ")</h2><table><thead>" + _th(["Param","URL","Status","Size Delta","Reflected","Payload","CWE"]) + "</thead><tbody>" + param_hits_html + "</tbody></table></div>" if self.param_hits else ""}
 
 {"<div class='section'><h2>Subdomains Found (" + str(len(self.subdomain_hits)) + ")</h2><table><thead>" + _th(["Subdomain","IPs","Status","Method"]) + "</thead><tbody>" + sub_hits_html + "</tbody></table></div>" if self.subdomain_hits else ""}
 
@@ -3498,43 +3308,11 @@ Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
         except Exception as e:
             log("SAVE", col(f"HTML report failed: {e}", C.YELLOW), C.YELLOW)
 
-    # ---- export targets for downstream tools ----
-    def export_targets(self) -> Tuple[str, str]:
-        """
-        Build targets.txt and sqlmap_targets.txt from crawl results and
-        return (targets_path, sqlmap_path) so print_summary can reference them.
-
-        Source data
-        -----------
-        self.results    -- list of page dicts produced by analyze_page().
-                           Each dict carries:
-                             "url"    the final page URL (after redirects)
-                             "params" list of param names seen on/from that page
-                             "status" HTTP status code
-                             "links"  outbound internal links (also carry params)
-
-        Selection logic
-        ---------------
-        targets.txt
-            Every URL that has at least one query parameter and returned a
-            2xx or 3xx status.  We iterate self.results for direct page URLs,
-            then also mine self.results[*]["links"] so we catch parameterised
-            URLs that were discovered but not crawled (e.g. beyond max-depth).
-            Duplicate URLs are removed; output is sorted for stable diffs.
-
-        sqlmap_targets.txt
-            Subset of targets.txt where at least one parameter either:
-              (a) is named after a common injectable identifier, or
-              (b) carries a numeric-looking value in the original URL.
-            We also include any URL that appeared in self.param_hits with
-            a confirmed finding, regardless of param name.
-        """
-        # ---- collect every URL-with-params from all sources ----
-        # candidate: {url_string} — keeps original query string intact
-        candidates: Dict[str, Set[str]] = {}   # url -> set of param names
+    def export_targets(self, pfx: str) -> Tuple[str, str]:
+        """Build targets.txt and sqlmap_targets.txt from crawl results."""
+        candidates: Dict[str, Set[str]] = {}
 
         def _register(url_str: str) -> None:
-            """Add url_str to candidates if it has query params and a good status."""
             if not url_str:
                 return
             parsed = urlparse(url_str)
@@ -3545,21 +3323,16 @@ Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
                 return
             candidates[url_str] = params
 
-        # Direct crawled pages
         for page in self.results:
             status = page.get("status") or 0
-            if status < 400:                   # 2xx and 3xx both valid targets
+            if status < 400:
                 _register(page.get("url", ""))
-            # Outbound links from this page (may have params we never crawled)
             for link in page.get("links", []):
                 _register(link)
 
-        # param_hits carry the exact target URL that was fuzzed — always include
         for hit in self.param_hits:
             _register(hit.get("url", ""))
 
-        # ---- sqlmap filter criteria ----
-        # (a) parameter names that are typically injection points
         INJECTABLE_NAMES: Set[str] = {
             "id", "uid", "user_id", "userid", "item_id", "itemid",
             "product_id", "productid", "product", "item", "cat",
@@ -3568,29 +3341,20 @@ Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
             "news_id", "blog_id", "entry_id", "record_id", "row_id",
         }
 
-        # (b) value looks numeric — "?id=42" is injectable; "?id=home" less so
         _NUMERIC_VAL_RE = re.compile(r"^\d+$")
-
-        # URLs confirmed injectable by param_hits (any severity)
         confirmed_urls: Set[str] = {h.get("url", "") for h in self.param_hits if h.get("url")}
 
         def _is_sqlmap_candidate(url_str: str, param_names: Set[str]) -> bool:
             if url_str in confirmed_urls:
                 return True
-            # Name-based heuristic
             if param_names & INJECTABLE_NAMES:
                 return True
-            # Value-based heuristic: any param carries a pure-numeric value
             qs = parse_qs(urlparse(url_str).query, keep_blank_values=True)
             for vals in qs.values():
                 if any(_NUMERIC_VAL_RE.match(v) for v in vals):
                     return True
             return False
 
-        # ---- write files atomically ----
-        ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_pfx = f"paramspecter_{self.base_domain.replace('.','_')}_{ts_str}"
-        pfx      = os.path.join(self.output_dir, base_pfx)
         t_path   = f"{pfx}_targets.txt"
         sql_path = f"{pfx}_sqlmap_targets.txt"
 
@@ -3626,7 +3390,7 @@ Generated: {_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>
 def main():
     print_banner()
     p = argparse.ArgumentParser(
-        description="ParamSpecter v5.0 -- Advanced Recon Crawler",
+        description="ParamSpecter v6.0 -- Advanced Recon Crawler",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
@@ -3679,11 +3443,14 @@ def main():
           Authenticated crawl via automated form login:
             python ParamSpecter.py https://example.com --login-url https://example.com/login \\
               --login-user admin@example.com --login-pass hunter2
-            python ParamSpecter.py https://example.com --login-url https://example.com/login \\
-              --login-user admin --login-pass secret \\
-              --login-user-field email --login-pass-field pwd
 
-          Ctrl+C once = graceful stop + save partial results
+          Quiet mode (suppress per-page output, only show findings and summary):
+            python ParamSpecter.py https://example.com --quiet
+
+          Verbose mode (show retry/skip/dupe messages):
+            python ParamSpecter.py https://example.com --verbose
+
+          Ctrl+C once = graceful stop (saves partial results)
           Ctrl+C twice = force quit immediately
         """)
     )
@@ -3767,14 +3534,14 @@ def main():
     p.add_argument("--deep-fuzz",    action="store_true",
                    help=(
                        "Extended vulnerability checks per param (implies --smart-fuzz):\n"
-                       "  SQLi: error-based + time-based blind (SLEEP detection)\n"
-                       "  XSS:  reflected payload detection (unencoded in body)\n"
-                       "  Path traversal: /etc/passwd + win.ini content matching\n"
-                       "  SSRF: AWS/GCP/Azure metadata endpoint probing\n"
-                       "  Open redirect: Location header + meta-refresh inspection\n"
-                       "  Header injection: Host header + CRLF injection\n"
-                       "  IDOR: numeric ID incrementation across params\n"
-                       "  Each finding printed with param, payload, evidence, and HIGH/MEDIUM/LOW severity."
+                       "  SQLi: error-based + time-based blind (SLEEP detection)  [CWE-89]\n"
+                       "  XSS:  reflected payload detection (unencoded in body)   [CWE-79]\n"
+                       "  Path traversal: /etc/passwd + win.ini content matching  [CWE-22]\n"
+                       "  SSRF: AWS/GCP/Azure metadata endpoint probing           [CWE-918]\n"
+                       "  Open redirect: Location header + meta-refresh           [CWE-601]\n"
+                       "  Header injection: Host header + CRLF injection          [CWE-113]\n"
+                       "  IDOR: numeric ID incrementation across params           [CWE-639]\n"
+                       "  Each finding includes param, payload, evidence, CWE, and severity."
                    ))
     p.add_argument("--payload-file", default=None, metavar="FILE",
                    help=(
@@ -3808,13 +3575,29 @@ def main():
     p.add_argument("--output-dir",   default=".", metavar="DIR",
                    help="Directory for all output files (default: current directory)")
 
+    # Verbosity (NEW in v6.0)
+    verbosity_group = p.add_mutually_exclusive_group()
+    verbosity_group.add_argument("--quiet",   action="store_true",
+                                 help="Suppress per-page output; show only findings and final summary")
+    verbosity_group.add_argument("--verbose", action="store_true",
+                                 help="Show retry, skip, and dedup messages (debug level)")
+
     args = p.parse_args()
 
-    # Validate login arg combinations
-    if args.login_url and (not args.login_user or not args.login_pass):
-        p.error("--login-url requires both --login-user and --login-pass")
+    # Apply verbosity level globally
+    if args.quiet:
+        VERBOSITY.level = 0
+    elif args.verbose:
+        VERBOSITY.level = 2
+    else:
+        VERBOSITY.level = 1
 
-    # Startup config table -- clean aligned layout
+    # Input validation
+    args.url = validate_url(args.url)
+    if getattr(args, "login_url", None):
+        if not args.login_user or not args.login_pass:
+            p.error("--login-url requires both --login-user and --login-pass")
+
     def _yn(v): return col("yes", C.GREEN) if v else col("no", C.GRAY)
     W = 20
     sep = col("─" * 60, C.GRAY)
@@ -3844,6 +3627,7 @@ def main():
     print(f"  {'Ignore robots':<{W}} {_yn(args.ignore_robots)}")
     print(f"  {'Playwright':<{W}} {_yn(args.playwright)}")
     print(f"  {'Resume':<{W}} {_yn(args.resume)}")
+    print(f"  {'Verbosity':<{W}} {col('quiet' if args.quiet else 'verbose' if args.verbose else 'normal', C.WHITE)}")
     if args.login_url:
         print(sep)
         print(f"  {col('FORM LOGIN', C.BOLD+C.WHITE)}")
@@ -3883,6 +3667,10 @@ def main():
         print(sep)
         print(f"  {col('NOTE:', C.YELLOW+C.BOLD)} dnspython not installed -- socket fallback active.")
         print(f"       Run: {col('pip install dnspython', C.CYAN)}")
+    if not TQDM_AVAILABLE:
+        print(sep)
+        print(f"  {col('NOTE:', C.YELLOW+C.BOLD)} tqdm not installed -- progress bars disabled.")
+        print(f"       Run: {col('pip install tqdm', C.CYAN)}")
     print(sep)
     print(f"  {col('Ctrl+C once = graceful stop (saves partial results)', C.GRAY)}")
     print(f"  {col('Ctrl+C twice = force quit immediately', C.GRAY)}")
