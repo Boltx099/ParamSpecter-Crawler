@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="paramspecter",
-    version="6.0",
-    description="Advanced Recon Crawler for Bug Bounty and Security Research",
+    version="7.4",
+    description="Advanced Recon Crawler with AI Triage, Auto Orchestrator & Watch Mode for Bug Bounty and Security Research",
     author="Boltx",
     packages=find_packages(),
     install_requires=[
