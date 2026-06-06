@@ -1,17 +1,118 @@
-# ParamSpecter v6.0 Requirements
+# ParamSpecter v7.4 Requirements
+# Updated for Tier 1 features: OOB detection, confidence scoring, session health
 
-# Core (required)
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=4.9.0          # faster HTML parser
+# ── Core (required) ───────────────────────────────────────────────
+requests>=2.31.0          # HTTP client + session management
+beautifulsoup4>=4.12.0    # HTML parsing
+lxml>=4.9.0               # faster BS4 parser backend
+dnspython>=2.4.0          # subdomain DNS resolution (A/AAAA/MX/NS/TXT/CNAME/SOA)
 
-# DNS resolution -- used by SubdomainHunter for brute-force + record analysis
-# Falls back to socket.gethostbyname() if missing, but performance is degraded
-dnspython>=2.4.0
+# ── Recommended ───────────────────────────────────────────────────
+tqdm>=4.66.0              # progress bars
+colorama>=0.4.6           # ANSI color on Windows terminals
 
-# Optional but recommended
-tqdm>=4.66.0             # progress bars
-colorama>=0.4.6          # Windows color support
+# ── WAF Bypass / TLS Fingerprint (HIGHLY RECOMMENDED) ────────────
+# Uses Chrome's actual TLS stack instead of Python's.
+# Bypasses Cloudflare, Akamai, DataDome, PerimeterX, and most
+# bot detection systems that fingerprint TLS handshakes.
+# Falls back to requests silently if not installed.
+#
+#   pip install curl-cffi
+#
+curl-cffi>=0.6.0
 
-# For JS rendering (optional, headless browser)
-# playwright>=1.40.0     # pip install playwright && playwright install chromium
+# ── OOB Blind Detection (optional, NEW in Tier 1) ─────────────────
+# Required ONLY if you use --oob with a private interactsh server
+# that uses AES-encrypted interaction payloads.
+#
+# For the PUBLIC interactsh pool (oast.pro, oast.live, etc.) no
+# extra dependencies are needed — stdlib urllib handles all comms.
+#
+# Install only if self-hosting interactsh with AES encryption enabled:
+#
+#   pip install pycryptodome
+#
+# pycryptodome>=3.19.0    # AES-CFB decryption for self-hosted interactsh
+
+# ── JS Rendering / SPA Support (optional) ────────────────────────
+# Required for --playwright flag and SPA auto-detection on JS-heavy
+# sites (React, Vue, Angular, Next.js).
+#
+#   pip install playwright
+#   playwright install chromium
+#
+# playwright>=1.40.0      # uncomment to pin version
+
+# ── Dashboard: --dashboard flag ───────────────────────────────────
+# Linux/macOS: curses is built-in — nothing to install.
+# Windows: install windows-curses for the full curses UI.
+# Without it, ParamSpecter falls back to a compact status line.
+#
+#   pip install windows-curses
+#
+# windows-curses>=2.3.0   # Windows only — uncomment to install
+
+# ── Phase 2: Watch Mode ───────────────────────────────────────────
+# No extra dependencies — stdlib only:
+#   sqlite3, smtplib, urllib (all built-in)
+
+# ── Phase 3: AI Triage + AI Chat (optional) ──────────────────────
+# No extra dependencies — all providers use stdlib urllib.
+# Set ONE of these env vars to enable AI features:
+#
+#   ANTHROPIC_API_KEY   → Claude       https://console.anthropic.com/
+#   OPENAI_API_KEY      → GPT-4o       https://platform.openai.com/api-keys
+#   GEMINI_API_KEY      → Gemini       https://aistudio.google.com/  (free tier)
+#   GROQ_API_KEY        → Llama3       https://console.groq.com/keys (free tier)
+#   MISTRAL_API_KEY     → Mistral      https://console.mistral.ai/
+#   OLLAMA_BASE_URL     → Local Ollama http://localhost:11434 (no key needed)
+#
+# Config file: ~/.paramspecter/ai.conf (auto-created on first run)
+# Check status: paramspecter --ai-status
+
+# ── Phase 1: Auto Orchestrator (optional external tools) ─────────
+# Standalone Go/pip binaries — install separately.
+# Auto-detected on Windows from Go/pipx/Scoop dirs.
+# Falls back to built-ins if missing.
+#
+#   subfinder   → go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+#   gau         → go install github.com/lc/gau/v2/cmd/gau@latest
+#   katana      → go install github.com/projectdiscovery/katana/cmd/katana@latest
+#   arjun       → pip install arjun
+#   dalfox      → go install github.com/hahwul/dalfox/v2@latest
+#   sqlmap      → pip install sqlmap
+#   nuclei      → go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+#   trufflehog  → go install github.com/trufflesecurity/trufflehog/v3@latest
+#   httpx       → go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+#
+#   interactsh  → go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+#               (optional — public interactsh pool works without this)
+#
+# Check installed: paramspecter --tools-status
+
+# ── Tier 3: Scope Diffing ─────────────────────────────────────────
+# No extra dependencies — stdlib only:
+#   json, urllib (all built-in)
+#
+# HackerOne/Bugcrowd scope fetching uses their public APIs (no auth needed):
+#   paramspecter --h1-program uber     → fetches scope from api.hackerone.com
+#   paramspecter --bc-program tesla    → fetches scope from bugcrowd.com
+#
+# Usage:
+#   paramspecter https://target.com --scope-diff prev_scan.json
+#   paramspecter https://target.com --h1-program shopify
+#   paramspecter https://target.com --bc-program verizon
+
+# ── Tier 3: Smart Resume ──────────────────────────────────────────
+# No extra dependencies — stdlib only (json built-in).
+# Checkpoint now stored as JSON at:
+#   paramspecter_<domain>_checkpoint.json
+# Old .txt checkpoints auto-upgrade on load.
+# Usage: paramspecter https://target.com --mode full --resume
+
+# ── Tier 3: Nuclei Template Generator ────────────────────────────
+# No extra dependencies for generation — stdlib only.
+# To RUN the generated templates, install nuclei:
+#   go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+#   nuclei -update-templates
+# Usage: paramspecter https://target.com --mode full --deep-fuzz --nuclei-gen
