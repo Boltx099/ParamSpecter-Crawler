@@ -14,7 +14,7 @@
 
 ## What is ParamSpecter?
 
-ParamSpecter is an advanced reconnaissance crawler built for bug bounty hunters and security researchers. It performs deep recursive crawling, JS analysis, subdomain discovery, directory enumeration, parameter fuzzing with active vulnerability detection, secret scanning, technology fingerprinting, automated form login — and now **out-of-band blind detection**, **confidence scoring**, and **session health monitoring** — all from a single command.
+ParamSpecter is an advanced AI reconnaissance crawler built for bug bounty hunters and security researchers. It performs deep recursive crawling, JS analysis, subdomain discovery, directory enumeration, parameter fuzzing with active vulnerability detection, secret scanning, technology fingerprinting, automated form login — and now **out-of-band blind detection**, **confidence scoring**, and **session health monitoring** — all from a single command.
 
 ---
 
