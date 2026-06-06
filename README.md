@@ -4,7 +4,7 @@
 
 ---
 
-# ParamSpecter v6.0 — Advanced Recon Crawler
+# ParamSpecter v7.4 — Advanced Recon Crawler
 
 > **For authorized and educational use ONLY.**
 > Only test targets you own or have explicit written permission to test.
@@ -14,148 +14,317 @@
 
 ## What is ParamSpecter?
 
-ParamSpecter is an advanced reconnaissance web crawler built for bug bounty hunting and security research. It performs deep recursive crawling, subdomain discovery, directory and file enumeration, parameter fuzzing with active vulnerability detection, JS analysis, secret detection, technology fingerprinting, automated form login, JS-rendered page crawling via Playwright, multi-domain scope control, scan resumption, custom payload injection, and downstream tool target export — all from a single command.
+ParamSpecter is an advanced reconnaissance crawler built for bug bounty hunters and security researchers. It performs deep recursive crawling, JS analysis, subdomain discovery, directory enumeration, parameter fuzzing with active vulnerability detection, secret scanning, technology fingerprinting, automated form login — and now **out-of-band blind detection**, **confidence scoring**, and **session health monitoring** — all from a single command.
 
 ---
 
 ## Changelog
 
-### v6.0 — Current Release
+### v7.4 — Current Release (Tier 3)
 
-**Architecture**
+**Smart Phase-Aware Resume (`--resume`)**
 
-Refactored from a single monolithic file into a proper Python package:
+The checkpoint system is now fully phase-aware. Instead of only tracking visited URLs, it stores the complete scan state including which phases completed, how many findings each produced, and discovered params/techs/subdomains. On resume, completed phases are skipped entirely — not just their URLs. If crawling and subdomain enumeration finished but the scan was interrupted during directory hunting, `--resume` jumps straight to directory hunting.
 
-```
-paramspecter/
-├── __init__.py
-├── __main__.py          ← python -m paramspecter entry point
-├── cli.py               ← argparse, banner, config display
-├── core/
-│   ├── analyzer.py      ← JSAnalyzer, analyze_page(), RobotsTxtHandler
-│   ├── crawler.py       ← ParamSpecter orchestrator + crawl worker
-│   └── stats.py         ← CrawlStats, CrawlQueue, TokenBucket, ProxyManager
-├── modules/
-│   ├── dirhunt.py       ← DirectoryHunter
-│   ├── login.py         ← FormLoginHandler
-│   ├── paramfuzz.py     ← DeepFuzzCheck subclasses + ParamFuzzer
-│   └── subdomain.py     ← SubdomainHunter
-├── output/
-│   └── reporter.py      ← JSON / CSV / HTML / JSONL output + export_targets()
-└── utils/
-    ├── constants.py     ← All regex patterns, wordlists, signatures
-    ├── helpers.py       ← Colors, logging, URL helpers, validation
-    └── http.py          ← fetch_with_retry(), Playwright, checkpoints
+```bash
+# Scan interrupted mid-way
+python -m paramspecter https://target.com --mode full --max-pages 100
+
+# Resume — skips already-completed phases automatically
+python -m paramspecter https://target.com --mode full --max-pages 100 --resume
 ```
 
-**Bug fixes**
+Checkpoint files are now JSON (`.json` instead of `.txt`) and stored atomically. Old `.txt` checkpoints still load fine.
 
-| Bug | Fix |
-|---|---|
-| Syntax error in `SECRET_PATTERNS` regex strings | `["\'']` → `["\']` in all 7 affected patterns |
-| Duplicate param hits printed and recorded twice | Hit recording moved inside dedup lock; `(param, payload)` key checked before append |
-| Blank lines between param results | tqdm removed from `_worker` and `_deep_worker`; per-hit `PARAM XX%` log lines provide progress without terminal corruption |
+**Scope Diffing (`--scope-diff`, `--h1-program`, `--bc-program`)**
 
-**New features**
+Compare current scan against a previous scan to surface only new attack surface — new endpoints, new parameters, new subdomains, new secrets, removed endpoints, and status changes.
 
-| Feature | Description |
-|---|---|
-| Retry with exponential backoff | Retries on `ConnectionReset`, 503, 429 with jitter |
-| Input validation | URL, file, and output-dir args validated upfront with clear error messages |
-| Configurable verbosity | `--quiet` (findings + summary only) / `--verbose` (retry/skip/dupe messages) |
-| Per-phase timing | Duration of each phase shown in summary and saved to JSON meta |
-| Request-rate telemetry | Total requests sent and avg req/s in summary and HTML report |
-| OpenAPI / Swagger discovery | Detects `swagger.json`, `openapi.yaml` linked from HTML during crawl |
-| robots.txt sitemap depth cap | Prevents infinite sitemap-index chains (max 3 hops) |
-| JSONL streaming writes | `--output jsonl` streams one JSON object per page, never buffers full result list in RAM |
-| CWE cross-reference | Deep-fuzz findings include CWE ID (e.g. `CWE-89`, `CWE-79`) |
+Also validates crawled URLs against HackerOne and Bugcrowd program scopes so you know before reporting whether a finding is in-scope.
+
+```bash
+# Save a baseline scan
+python -m paramspecter https://target.com --mode full -o json
+
+# A week later — show only what's new
+python -m paramspecter https://target.com --mode full --scope-diff paramspecter_target_com_20260101_120000.json
+
+# Validate scope against HackerOne program
+python -m paramspecter https://target.com --mode full --h1-program uber
+
+# Validate scope against Bugcrowd program
+python -m paramspecter https://target.com --mode full --bc-program tesla
+```
+
+**Nuclei Template Auto-Generator (`--nuclei-gen`)**
+
+Generates a complete set of production-quality Nuclei YAML templates from all findings. Creates four template categories with a ready-to-run shell script.
+
+```bash
+python -m paramspecter https://target.com --mode full --deep-fuzz --nuclei-gen
+
+# Then run all generated templates:
+nuclei -t ./paramspecter_target_com_*_nuclei_templates/ -u https://target.com
+# Or use the generated run script:
+./paramspecter_target_com_*_nuclei_templates/run.sh
+```
+
+Template categories generated: `vulnerabilities/` (SQLi, XSS, SSRF, etc.), `secrets/` (exposed credentials), `paths/` (discovered endpoints), `headers/` (missing security headers). Each template includes evidence-based matchers, CVSS metadata, CWE IDs, and proper tags.
+
+### v7.3 — Tier 2
+
+**Adaptive AI Prompting by Tech Stack**
+
+AI triage and chat now inject tech-specific attack guidance based on detected technologies. Covers 11 stacks: WordPress, Laravel, Django, Rails, Spring/Java, GraphQL, AWS, Next.js, Node.js, PHP, Nginx, Apache. If Spring Boot is detected, the AI automatically focuses on Actuator endpoints, heapdump credential extraction, Spring4Shell, and Thymeleaf SSTI instead of giving generic advice.
+
+**Professional Pentest Report (`--pro-report`)**
+
+Deliverable-ready HTML report with CVSS v3 scores, executive summary, impact analysis, OWASP/CWE mapping, copy-paste curl PoC commands, confidence bars, and auto-generated Nuclei YAML templates for every finding.
+
+```bash
+python -m paramspecter https://target.com --mode full --deep-fuzz --pro-report --ai-triage
+```
+
+**JavaScript Source Map Exploitation**
+
+Detected source maps are automatically downloaded and original pre-minified TypeScript/JSX source is scanned for secrets, internal API paths, and security-relevant developer comments. Runs automatically — no flag needed.
+
+### v7.2 — Tier 1 Security Intelligence Update (Current)
+
+Three major new systems that put ParamSpecter in a different class from free open-source tools.
 
 ---
 
-### v5.0
+#### 🔴 Feature 1 — OOB Blind Detection Engine (`--oob`)
 
-| Feature | Description |
-|---|---|
-| Header Injection check | `--deep-fuzz` — Host header injection + CRLF injection detection |
-| IDOR check | `--deep-fuzz` — Numeric ID incrementation across params |
-| Custom payload file | `--payload-file FILE` |
-| Scope file | `--scope-file FILE` — Multi-domain bug bounty scope |
-| Rate limit CLI | `--rate-limit REQ/S` |
-| Resume / checkpoint | `--resume` |
-| Output directory | `--output-dir DIR` |
-| HTML report | Auto-generated dark-theme report on every scan |
+**The single biggest gap in most free scanners.** Blind SQLi, SSRF, XXE, CMDi, and Log4Shell never appear in response analysis — they only show up when the server phones home. ParamSpecter now detects them automatically via [interactsh](https://github.com/projectdiscovery/interactsh) (ProjectDiscovery's free Burp Collaborator alternative).
 
-### v4.3
+**45 payloads across 6 vulnerability classes:**
 
-| Feature | Description |
-|---|---|
-| Playwright crawling | `--playwright` — Headless Chromium + XHR interception |
-| Form-based login | `--login-url` — Auto CSRF extraction + session injection |
-| Deep vulnerability fuzzing | `--deep-fuzz` — SQLi, XSS, PathTraversal, SSRF, OpenRedirect |
-| Target export | `--export-targets` — nuclei + sqlmap target lists |
+| Class | Payloads | Coverage |
+|---|---|---|
+| **BlindSQLi** | 8 | MySQL `LOAD_FILE` UNC, MSSQL `xp_dirtree`/`xp_subdirs`, Oracle `UTL_HTTP`/`UTL_INADDR`, PostgreSQL `COPY TO PROGRAM` |
+| **BlindSSRF** | 9 | HTTP/HTTPS, `dict://`, `gopher://`, IPv6 bypass, `@`-bypass, double-slash, AWS metadata redirect |
+| **BlindXXE** | 4 | Classic entity, parameter entity (bypasses basic filters), SVG XXE, ZIP/Excel XXE |
+| **BlindCMDi** | 11 | Backtick, `$()`, `;`, `\|`, `&&`, `curl`/`wget`, Windows `&`, newline injection |
+| **Log4Shell** | 7 | JNDI ldap/dns/rmi + 4 WAF-bypass obfuscation variants |
+| **BlindSSTI** | 5 | Jinja2, Freemarker, Velocity, Smarty, Pebble |
+
+**Log4Shell also injects into 9 HTTP headers** that commonly get logged server-side: `User-Agent`, `X-Forwarded-For`, `CF-Connecting-IP`, `X-Originating-IP`, `X-Remote-Addr`, `X-Api-Version`, `Referer`, `X-Request-Id`, `X-Remote-IP`.
+
+Every payload embeds a **unique subdomain** so each DNS/HTTP callback is attributed to the exact parameter that triggered it. No manual correlation needed.
+
+Uses the **public interactsh pool** by default — no server, no account, no config needed:
+
+```bash
+# Enable OOB detection
+paramspecter https://target.com --mode param --deep-fuzz --oob
+
+# Use a self-hosted interactsh server
+paramspecter https://target.com --oob --oob-server https://my-interact.sh
+```
+
+Output in terminal and HTML report:
+```
+[OOB]  [!!!] BLIND HIT  BlindSQLi  param=id  via=DNS  from=13.56.23.10
+       DNS callback confirmed from 13.56.23.10 to sqli-a1b2c3.abc123.oast.pro
+       [95% CONFIRMED]
+```
+
+OOB findings get their own section in the HTML report — separated from response-analysis hits — so you know immediately which ones are confirmed vs heuristic.
+
+**No extra dependencies for public interactsh pool.** Install `pycryptodome` only if self-hosting interactsh with AES encryption.
+
+---
+
+#### 🟡 Feature 2 — Confidence Scoring Engine (`--min-confidence`)
+
+Every finding now gets a **0–100 confidence score** so you know which bugs to act on first and which are likely false positives.
+
+| Score | Label | Action |
+|---|---|---|
+| **85–100** | `CONFIRMED` | Act on this. Hard evidence. |
+| **65–84** | `LIKELY` | Strong signal — investigate. |
+| **40–64** | `POSSIBLE` | Interesting — manual verify. |
+| **20–39** | `LOW-CONFIDENCE` | Probably FP. |
+| **0–19** | `NOISE` | Drop it. |
+
+**Per-check scoring logic — not a one-size-fits-all formula:**
+
+- **SQLi**: DB error keyword match (+35), time delta ≥ 2.5s above baseline (+30), stack trace leaked (+15), HTTP 500 (+10). Penalised for WAF block pages (-20), Cloudflare challenges (-25), empty bodies (-15).
+- **XSS**: Unencoded `<script>alert()` in response (+40), event handler reflected (+30), `alert(1)` without entity encoding (+20). Penalised heavily if payload was HTML-entity encoded (-25) — that's output escaping, not a bug.
+- **PathTraversal**: `/etc/passwd` or `win.ini` content in response (+50). This one is binary — either you have it or you don't.
+- **SSRF**: Cloud metadata content (AMI IDs, IAM credentials) (+50), internal RFC-1918 IP in body (+25).
+- **CORS**: Evil origin reflected in `ACAO` header (+35), `ACAC: true` with reflected origin (+10), `ACAO: null` (+15).
+- **OOB**: Always 85–97. DNS/HTTP callbacks are cryptographically attributed — they don't lie.
+
+Noise filtering — drop everything below a threshold before saving:
+
+```bash
+# Keep only POSSIBLE and above (recommended starting point)
+paramspecter https://target.com --mode param --deep-fuzz --min-confidence 40
+
+# Keep only high-confidence findings (CONFIRMED + LIKELY)
+paramspecter https://target.com --mode param --deep-fuzz --min-confidence 65
+```
+
+The HTML report shows confidence badges colour-coded by level. The JSON export includes `confidence`, `conf_label`, `conf_reasons`, and a `finding_summary` block with counts per tier.
+
+---
+
+#### 🟢 Feature 3 — Session Health Monitor
+
+Authenticated scans silently break when JWTs expire, CSRF tokens rotate, or Laravel sessions time out. Every page starts returning a login form — the scanner keeps crawling, finding nothing, and you don't know until you look at the empty output.
+
+ParamSpecter now detects session expiry in real time and re-authenticates automatically without stopping the scan.
+
+**How it works:**
+
+1. After initial login, the monitor learns what "healthy" looks like: which indicator strings appear only when logged in, which cookies must be present.
+2. Every 20 pages (configurable), it GETs a check URL and verifies the indicators are still there.
+3. On any `401`/`403` response during crawl, it triggers an immediate check.
+4. If unhealthy: re-runs `FormLoginHandler.login()` up to 3 times with exponential backoff. Up to 5 full heal events before flagging the scan as broken.
+5. While healing, other worker threads pause briefly so no URLs are lost from the queue.
+
+```bash
+# Basic — auto-detects auth indicators ("logout", "dashboard", etc.)
+paramspecter https://target.com \
+  --login-url https://target.com/login \
+  --login-user admin --login-pass password \
+  --mode full
+
+# Custom indicators (use strings unique to authenticated pages)
+paramspecter https://target.com \
+  --login-url https://target.com/login \
+  --login-user admin --login-pass password \
+  --auth-indicators "Welcome, Admin" "Sign Out" "My Dashboard" \
+  --auth-check-url https://target.com/dashboard \
+  --health-check-interval 10
+```
+
+Session health summary in final output:
+```
+Session Health:  12 checks, 2 heals, 0 failed re-auths — OK
+```
+
+---
+
+### Previous Releases
+
+#### v7.2 (pre-Tier1) — Chrome TLS + SPA Detection
+
+- **Chrome TLS fingerprint spoofing** via `curl_cffi` — bypasses Cloudflare/DataDome/Akamai bot detection that fingerprints Python's TLS handshake
+- **SPA auto-detection** — upgrades to Playwright automatically when a page returns a JS shell with < 500 chars visible text
+- **Full XHR/fetch/WebSocket interception** — intercepts all network traffic, blocks images/fonts for 3–5× speed improvement
+- **Playwright resource blocking via `page.route()`** — fixed from v7.1 where `request.abort()` was incorrectly called on non-intercepted requests
+
+#### v7.1 — Live Dashboard + AI Chat + Burp Export
+
+- **Live terminal dashboard** — real-time curses UI, 4 updates/second, falls back gracefully on Windows CMD
+- **AI Chat mode** (`--ai-chat`) — multi-turn conversation about scan results with full history
+- **Burp Suite XML export** (`--burp-export`) — param hit payloads injected into URLs, high findings highlighted red
+
+#### v7.0 — Auto Orchestrator + Watch Mode + AI Triage
+
+- **Auto Orchestrator** (`--auto`) — detects and runs subfinder, gau, katana, arjun, dalfox, sqlmap, nuclei, trufflehog; merges all results
+- **Watch Mode** (`--watch`) — continuous monitoring with SQLite diff engine; alerts via Slack/Discord/Telegram/email
+- **AI Triage** (`--ai-triage`) — 7 provider support (Anthropic, OpenAI, Gemini, Groq, Mistral, Ollama, custom); BYOK
+
+#### v6.0
+
+Refactored from a single monolithic file into a proper Python package. Added IDOR, HeaderInjection, OpenAPI discovery, JSONL streaming, per-phase timing, CWE cross-references, scope file, rate limiting, resume/checkpoint, HTML report.
 
 ---
 
 ## Installation
 
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/Boltx/ParamSpecter-Crawler.git
 cd ParamSpecter-Crawler
 ```
 
-### 2. (Recommended) Create a virtual environment
+### 2. Virtual environment (recommended)
 
 ```bash
 # Linux / macOS
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 
 # Windows CMD
-python -m venv venv
-venv\Scripts\activate.bat
+python -m venv venv && venv\Scripts\activate.bat
 
 # Windows PowerShell
-python -m venv venv
-venv\Scripts\Activate.ps1
+python -m venv venv; venv\Scripts\Activate.ps1
 ```
 
-### 3. Install core dependencies
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**What gets installed:**
-
-| Package | Version | Purpose |
-|---|---|---|
-| `requests` | ≥ 2.31.0 | HTTP client for all crawl, fuzz, and probe requests |
-| `beautifulsoup4` | ≥ 4.12.0 | HTML parsing — links, forms, comments, meta tags |
-| `lxml` | ≥ 4.9.0 | Faster HTML parser backend for BeautifulSoup |
-| `dnspython` | ≥ 2.4.0 | Full DNS resolution (A, AAAA, MX, NS, TXT, CNAME, SOA) |
-| `tqdm` | ≥ 4.66.0 | Progress bars for directory hunt and subdomain brute-force |
-| `colorama` | ≥ 0.4.6 | ANSI color support on Windows terminals |
-
-### 4. (Optional) Install Playwright for JS rendering
-
-Required only when using the `--playwright` flag:
+### 4. (Optional but strongly recommended) WAF bypass
 
 ```bash
-pip install playwright
-playwright install chromium
+pip install curl-cffi
 ```
 
-Without Playwright, `--playwright` logs a warning and automatically falls back to `requests`.
+You'll see `HTTP  Using curl_cffi — Chrome TLS fingerprint active` at startup.
 
-### 5. (Optional) Install as a system command
+### 5. (Optional) OOB with AES-encrypted self-hosted interactsh
+
+Public interactsh pool works with zero extra dependencies. Only needed if self-hosting with AES encryption:
+
+```bash
+pip install pycryptodome
+```
+
+### 6. (Optional) JS-rendered sites
+
+```bash
+pip install playwright && playwright install chromium
+```
+
+### 7. (Optional) Install as global command
 
 ```bash
 pip install -e .
+# Now run: paramspecter https://example.com
 ```
 
-Registers the `paramspecter` command globally so you can run it from anywhere without `python -m`.
+### 8. (Optional) External tools for Auto Orchestrator
+
+```bash
+# Go tools (requires Go 1.21+: https://go.dev/dl/)
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/lc/gau/v2/cmd/gau@latest
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/hahwul/dalfox/v2@latest
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install github.com/trufflesecurity/trufflehog/v3@latest
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+
+# Python tools
+pip install arjun sqlmap
+
+# OOB self-hosted (optional — public pool works without this)
+go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+
+paramspecter --tools-status   # verify what's detected
+```
+
+### 9. (Optional) AI providers
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...    # Claude
+export OPENAI_API_KEY=sk-...           # GPT-4o
+export GEMINI_API_KEY=AI...            # free tier
+export GROQ_API_KEY=gsk_...            # free tier, fastest
+# or: ollama serve && ollama pull llama3
+
+paramspecter --ai-status               # verify detection
+```
 
 ---
 
@@ -163,127 +332,46 @@ Registers the `paramspecter` command globally so you can run it from anywhere wi
 
 | Requirement | Minimum |
 |---|---|
-| Python | 3.8 or newer |
+| Python | 3.8+ |
 | OS | Linux, macOS, Windows |
-| RAM | 256 MB (Playwright crawls may use more) |
+| RAM | 256 MB (512 MB+ with Playwright) |
 | Network | Outbound HTTP/HTTPS + DNS |
-
-### Check your Python version
-
-```bash
-python3 --version
-```
-
-If you have Python 3.7 or older, upgrade:
-
-```bash
-# Ubuntu / Debian
-sudo apt install python3.11
-
-# macOS (Homebrew)
-brew install python@3.11
-
-# Windows — download from https://www.python.org/downloads/
-```
-
-### Install pip if missing
-
-```bash
-# Ubuntu / Debian
-sudo apt install python3-pip
-
-# macOS / Windows
-python3 -m ensurepip --upgrade
-```
 
 ---
 
 ## Quick Start
 
-> **v6.0 is now a package.** Use `python -m paramspecter` instead of `python ParamSpecter.py`.
-> After `pip install -e .` you can also just run `paramspecter` directly.
-
 ```bash
 # Basic crawl
-python -m paramspecter https://example.com --ignore-robots
+paramspecter https://example.com
 
-# Subdomain enumeration
-python -m paramspecter https://example.com --mode subdomain
-python -m paramspecter https://example.com --mode subdomain --sub-wordlist subs.txt
+# Full recon — all built-in phases
+paramspecter https://example.com --mode full -t 20 --ignore-robots
 
-# Directory hunting (recursive, with extensions)
-python -m paramspecter https://example.com --mode fuzz --recursive
-python -m paramspecter https://example.com --mode fuzz -w dirs.txt -x .php,.html,.bak --recursive-depth 3
+# Deep fuzz with OOB blind detection + noise filtering
+paramspecter https://example.com --mode param --deep-fuzz \
+  --oob --min-confidence 40
 
-# Parameter fuzzing (smart = 6 payloads per param)
-python -m paramspecter https://example.com/search --mode param --smart-fuzz
-
-# Deep vulnerability scan (SQLi / XSS / LFI / SSRF / redirect / header injection / IDOR)
-python -m paramspecter https://example.com/search --mode param --deep-fuzz
-
-# Deep fuzz via POST with custom payloads
-python -m paramspecter https://example.com/search --mode param --deep-fuzz \
-  --param-method POST --payload-file my_payloads.txt
-
-# Full recon: all four phases in order
-python -m paramspecter https://example.com --mode full -t 20 --ignore-robots
-
-# Multi-domain scope file
-python -m paramspecter https://example.com --mode full --scope-file scope.txt
-
-# Rate limiting (max 5 req/s per host)
-python -m paramspecter https://example.com --rate-limit 5
-
-# Resume an interrupted scan
-python -m paramspecter https://example.com --resume
-python -m paramspecter https://example.com --resume --resume-file /tmp/my_checkpoint.txt
-
-# Save all output to a specific directory
-python -m paramspecter https://example.com --output-dir /tmp/scans/example/
-
-# Memory-efficient JSONL streaming (large crawls)
-python -m paramspecter https://example.com --output jsonl
-
-# JS-rendered crawl with XHR endpoint discovery
-python -m paramspecter https://example.com --playwright
-
-# Automated form login before crawling
-python -m paramspecter https://example.com \
+# Authenticated full scan with session health monitor
+paramspecter https://example.com --mode full \
   --login-url https://example.com/login \
-  --login-user admin@example.com \
-  --login-pass hunter2
+  --login-user admin --login-pass hunter2 \
+  --auth-indicators "Logout" "My Account" \
+  --oob --deep-fuzz --min-confidence 20
 
-# Form login with non-standard field names
-python -m paramspecter https://example.com \
-  --login-url https://example.com/login \
-  --login-user admin \
-  --login-pass secret \
-  --login-user-field email \
-  --login-pass-field pwd
+# Everything — full scan + auto orchestrator + OOB + AI triage
+paramspecter https://example.com --mode full --auto \
+  --oob --deep-fuzz --min-confidence 20 \
+  --ai-triage --ai-provider groq
 
-# Export nuclei + sqlmap target lists after crawl
-python -m paramspecter https://example.com --export-targets
-python -m paramspecter https://example.com --mode full --export-targets --ignore-robots
+# Watch mode — re-scan every 6 hours, alert on new findings
+paramspecter https://example.com --watch --interval 6h \
+  --notify-webhook https://hooks.slack.com/services/YOUR/WEBHOOK
 
-# Deep crawl with UA rotation and Burp proxy
-python -m paramspecter https://example.com \
-  --ignore-robots --depth 6 --threads 15 \
-  --rotate-ua --proxies http://127.0.0.1:8080
-
-# Authenticated session via static cookie
-python -m paramspecter https://example.com \
-  --cookies "session=abc123; auth=xyz" \
-  --headers "X-API-Key: mykey" "Authorization: Bearer token123"
-
-# Quiet mode (only findings and summary)
-python -m paramspecter https://example.com --quiet
-
-# Verbose mode (retry/skip/dupe messages)
-python -m paramspecter https://example.com --verbose
+# Check tools + providers
+paramspecter --tools-status
+paramspecter --ai-status
 ```
-
-**Ctrl+C once** — graceful stop, saves partial results and checkpoint.
-**Ctrl+C twice** — force quit immediately.
 
 ---
 
@@ -302,19 +390,11 @@ crawl:
   -D, --depth                Max crawl depth (default: 4)
   -t, --threads              Number of worker threads (default: 10)
   --timeout                  Request timeout in seconds (default: 10)
-  --max-retries              Max retries per URL with exponential backoff (default: 3)
+  --max-retries              Max retries per URL (default: 3)
   --strategy                 bfs | dfs | priority  (default: bfs)
   --follow-external          Follow links to external domains
   --ignore-robots            Ignore robots.txt restrictions
   --playwright               Use headless Chromium for JS rendering + XHR interception
-
-scope:
-  --scope-file FILE          File of in-scope domains (one per line, wildcards: *.example.com)
-
-rate and resume:
-  --rate-limit REQ/S         Max requests per second per host (default: threads × 0.8)
-  --resume                   Resume a previous scan — skips already-visited URLs
-  --resume-file FILE         Path to checkpoint file (default: auto-named in --output-dir)
 
 identity and evasion:
   -u, --user-agent           Custom User-Agent string
@@ -324,11 +404,19 @@ identity and evasion:
   --proxies                  Comma-separated proxy list: http://127.0.0.1:8080,...
 
 authentication:
-  --login-url URL            Login page URL — triggers automated form login before crawling
-  --login-user USER          Username or email to submit
-  --login-pass PASS          Password to submit
-  --login-user-field FIELD   name= attribute of the username input (default: username)
-  --login-pass-field FIELD   name= attribute of the password input (default: password)
+  --login-url URL            Login page URL — triggers automated form login
+  --login-user USER          Username or email
+  --login-pass PASS          Password
+  --login-user-field FIELD   name= of username input (default: username)
+  --login-pass-field FIELD   name= of password input (default: password)
+
+── Session Health Monitor (NEW) ─────────────────────────────────
+  --auth-check-url URL       URL to GET to verify auth is still alive
+                             (default: --login-url)
+  --auth-indicators STRING+  Strings that ONLY appear when logged in
+                             e.g. --auth-indicators "Logout" "My Dashboard"
+                             (default: auto-detect common patterns)
+  --health-check-interval N  Check session health every N pages (default: 20)
 
 subdomain enumeration:
   -sw, --sub-wordlist        Custom subdomain wordlist
@@ -344,36 +432,95 @@ directory hunting:
 parameter fuzzing:
   -pw, --param-wordlist      Parameter wordlist
   --param-method             GET | POST  (default: GET)
-  --smart-fuzz               Test 6 payloads per param (SQLi, XSS, SSRF, SSTI, traversal)
-  --deep-fuzz                Extended per-param vuln checks with CWE refs (implies --smart-fuzz)
+  --smart-fuzz               Test 6 payloads per param
+  --deep-fuzz                Full per-param vuln checks with CWE refs
   --payload-file FILE        Custom payload file: LABEL:payload per line
-                             Labels: SQLi XSS PathTraversal SSRF OpenRedirect HeaderInjection IDOR
 
-output:
+── OOB Blind Detection (NEW) ────────────────────────────────────
+  --oob                      Enable out-of-band blind detection via interactsh
+                             Finds: blind SQLi, SSRF, XXE, CMDi, Log4Shell, SSTI
+                             Uses public interactsh pool by default (no config needed)
+  --oob-server URL           Custom interactsh server URL
+                             (default: auto-select from public pool)
+
+── Confidence Scoring (NEW) ─────────────────────────────────────
+  --min-confidence 0-100     Drop findings below this confidence score
+                             0 = keep all findings (default)
+                             20 = remove obvious noise
+                             40 = POSSIBLE and above only (recommended)
+                             65 = LIKELY and CONFIRMED only
+
+scope / rate / resume / output:
+  --scope-file FILE          File of in-scope domains (wildcards: *.example.com)
+  --rate-limit REQ/S         Max requests per second per host
+  --resume                   Resume a previous scan
+  --resume-file FILE         Path to checkpoint file
   -o, --output               json | csv | both | jsonl  (default: both)
-  --output-dir DIR           Directory for all output files (default: current directory)
+  --output-dir DIR           Directory for all output files (default: .))
   --export-targets           Write nuclei-ready targets.txt + sqlmap_targets.txt
 
 verbosity (mutually exclusive):
-  --quiet                    Suppress per-page output; show only findings and final summary
-  --verbose                  Show retry, skip, and dedup messages (debug level)
+  --quiet                    Findings and summary only
+  --verbose                  Show retry, skip, and dedup messages
+
+── Auto Orchestrator ────────────────────────────────────────────
+  --auto                     Run all available external tools and merge results
+  --tools-status             Show which external tools are installed and exit
+
+── Watch Mode ───────────────────────────────────────────────────
+  --watch                    Continuous monitoring — re-scan on a schedule
+  --interval INTERVAL        Scan interval: 6h, 30m, 1d  (default: 24h)
+  --watch-db FILE            SQLite db file for scan history
+  --notify-webhook URL       Webhook URL for alerts (Slack / Discord / custom)
+  --notify-telegram          Send Telegram alerts
+  --tg-token TOKEN           Telegram bot token
+  --tg-chat CHAT_ID          Telegram chat ID
+  --notify-email TO          Email address for alerts
+  --smtp-host HOST           SMTP server hostname
+  --smtp-port PORT           SMTP port (default: 587)
+  --smtp-user USER           SMTP username
+  --smtp-pass PASS           SMTP password
+
+── AI Triage ────────────────────────────────────────────────────
+  --ai-triage                AI-powered attack surface analysis after scan
+  --ai-chat                  Interactive AI chat about scan results
+  --ai-provider PROVIDER     anthropic | openai | gemini | groq | mistral | ollama | custom
+  --ai-model MODEL           Model override: gpt-4o, claude-sonnet-4-5, llama3
+  --ai-status                Show configured AI providers and exit
+
+── Output Extras ────────────────────────────────────────────────
+  --burp-export              Export results as Burp Suite XML
+  --dashboard                Live terminal dashboard during scan
+  --pro-report               Professional pentest report with CVSS, PoC commands, nuclei templates
+  --nuclei-gen               Auto-generate Nuclei YAML templates for all findings
+
+── Scope Diffing (Tier 3) ───────────────────────────────────────
+  --scope-diff PREV_JSON     Diff against a previous scan JSON — shows only new attack surface
+  --h1-program HANDLE        Validate scope against HackerOne program  (e.g. uber, shopify)
+  --bc-program HANDLE        Validate scope against Bugcrowd program   (e.g. tesla, verizon)
 ```
 
 ---
 
-## Deep Fuzz (`--deep-fuzz`)
+## Deep Fuzz Checks (`--deep-fuzz`)
 
-Seven categories, all with CWE cross-reference:
-
-| Check | Severity | CWE | Detection |
+| Check | Severity | CWE | Detection method |
 |---|---|---|---|
-| SQLi | HIGH | CWE-89 | DB error keywords + time-based blind (SLEEP) |
-| XSS | HIGH | CWE-79 | Payload reflected unencoded in response body |
+| SQLi | HIGH | CWE-89 | DB error keywords + baseline-aware time-based blind |
+| XSS | HIGH | CWE-79 | Unencoded reflection + event handler survives tag strip |
 | PathTraversal | HIGH | CWE-22 | `/etc/passwd` or `win.ini` content in response |
-| SSRF | HIGH | CWE-918 | AWS/GCP/Azure metadata content in response |
-| OpenRedirect | MEDIUM | CWE-601 | `Location` header or meta-refresh to canary domain |
-| HeaderInjection | HIGH | CWE-113 | Host header reflected + CRLF injected header appears |
-| IDOR | HIGH | CWE-639 | Status change or size delta on numeric ID ±1/±100/0 |
+| SSRF | HIGH | CWE-918 | AWS/GCP/Azure metadata endpoint content |
+| OpenRedirect | MEDIUM | CWE-601 | `Location` header redirect to canary domain |
+| HeaderInjection | HIGH | CWE-113 | CRLF injected header appears in response |
+| IDOR | HIGH | CWE-639 | Status/size delta on numeric ID ±1/±100/0 |
+| GraphQL | MEDIUM | CWE-200 | Introspection query on 9 common endpoints |
+| CORS | HIGH | CWE-942 | Reflects evil Origin with credentials, `ACAO: null` |
+| **BlindSQLi** | **CRITICAL** | **CWE-89** | **OOB DNS/HTTP callback (--oob)** |
+| **BlindSSRF** | **CRITICAL** | **CWE-918** | **OOB HTTP callback (--oob)** |
+| **BlindXXE** | **CRITICAL** | **CWE-611** | **OOB HTTP callback (--oob)** |
+| **BlindCMDi** | **CRITICAL** | **CWE-78** | **OOB DNS callback (--oob)** |
+| **Log4Shell** | **CRITICAL** | **CWE-917** | **OOB JNDI callback (--oob)** |
+| **BlindSSTI** | **CRITICAL** | **CWE-94** | **OOB DNS callback (--oob)** |
 
 Custom payload file format:
 
@@ -381,7 +528,7 @@ Custom payload file format:
 # my_payloads.txt
 SQLi:' OR SLEEP(10)-- -
 XSS:<details open ontoggle=alert(1)>
-HeaderInjection:crlf_inject:%0d%0aSet-Cookie:injected=1
+HeaderInjection:%0d%0aSet-Cookie:injected=1
 IDOR:99999
 ```
 
@@ -389,22 +536,23 @@ IDOR:99999
 
 ## Output Files
 
-All files written atomically (temp + rename). Ctrl+C mid-write never produces a corrupt file.
+All files written atomically (temp + rename). Ctrl+C mid-write never corrupts output.
 
 | File | Contents |
 |---|---|
-| `<pfx>.json` | Full scan: pages, secrets, dir hits, param hits, subdomain hits |
-| `<pfx>.jsonl` | Streaming — one page JSON per line (`--output jsonl`) |
-| `<pfx>_meta.json` | Scan metadata when using `--output jsonl` |
+| `<pfx>_report.html` | Dark-theme HTML report — OOB findings in red section, confidence badges on all hits |
+| `<pfx>.json` | Full scan data including `oob_hits`, `confirmed_hits`, `finding_summary`, `session_health` |
 | `<pfx>.csv` | Per-page flat CSV |
-| `<pfx>_report.html` | Self-contained dark-theme HTML report |
-| `<pfx>_dirs.csv` | Directory hit: URL, status, size, redirect |
-| `<pfx>_params.csv` | Param findings with CWE column |
-| `<pfx>_secrets.csv` | Secrets: type, value (truncated 80 chars), source URL |
-| `<pfx>_subdomains.csv` | Subdomains: FQDN, IPs, method, HTTP status, title |
-| `<pfx>_targets.txt` | All parameterised URLs — nuclei-ready (`--export-targets`) |
-| `<pfx>_sqlmap_targets.txt` | Injectable subset — sqlmap-ready (`--export-targets`) |
-| `<pfx>_checkpoint.txt` | Visited URLs for `--resume` (auto-saved every 50 pages) |
+| `<pfx>.jsonl` | Streaming — one page JSON per line (`--output jsonl`) |
+| `<pfx>_dirs.csv` | Directory hits: URL, status, size, redirect |
+| `<pfx>_params.csv` | Param findings with CWE + confidence columns |
+| `<pfx>_secrets.csv` | Secrets: type, value (truncated), source URL |
+| `<pfx>_subdomains.csv` | Subdomains: FQDN, IPs, method, HTTP status |
+| `<pfx>_targets.txt` | All parameterised URLs — nuclei-ready |
+| `<pfx>_sqlmap_targets.txt` | Injectable subset — sqlmap-ready |
+| `<pfx>_checkpoint.json` | Smart phase-aware checkpoint for `--resume` (JSON, saved every 50 pages and on Ctrl+C) |
+| `<pfx>_ai_triage.md` | AI triage report in Markdown (also embedded in HTML) |
+| `paramspecter_watch_<domain>.db` | SQLite scan history for watch mode |
 
 `<pfx>` = `paramspecter_<domain>_<YYYYMMDD_HHMMSS>`
 
@@ -413,34 +561,49 @@ All files written atomically (temp + rename). Ctrl+C mid-write never produces a 
 ## Architecture
 
 ```
-ParamSpecter v6.0
-├── utils/
-│   ├── constants.py     All regex patterns, built-in wordlists, tech/WAF signatures
-│   ├── helpers.py       Colors, logging, URL helpers, input validation
-│   └── http.py          fetch_with_retry() + backoff, Playwright fetch, checkpoints
+paramspecter/
+├── cli.py               argparse, banner, entry point — wires all tiers together
 ├── core/
-│   ├── stats.py         CrawlStats, CrawlQueue (BFS/DFS/Priority), TokenBucket, ProxyManager
-│   ├── analyzer.py      RobotsTxtHandler, JSAnalyzer, analyze_page()
-│   └── crawler.py       ParamSpecter — phase orchestration + crawl worker + summary
+│   ├── analyzer.py      JSAnalyzer (async), SourceMapExploiter, analyze_page(), RobotsTxtHandler
+│   ├── crawler.py       ParamSpecter orchestrator + crawl worker + PhaseManager integration
+│   └── stats.py         CrawlStats, CrawlQueue, TokenBucket, ProxyManager
 ├── modules/
-│   ├── subdomain.py     SubdomainHunter — DNS brute + crt.sh + HTTP probe
-│   ├── dirhunt.py       DirectoryHunter — wildcard detection + recursive enumeration
-│   ├── paramfuzz.py     ParamFuzzer + all DeepFuzzCheck subclasses
-│   └── login.py         FormLoginHandler — CSRF extraction + session injection
-└── output/
-    └── reporter.py      JSON / CSV / JSONL / HTML output + export_targets()
+│   ├── oob.py           ★ Tier 1 — OOB blind detection (interactsh, 45 payloads, 6 checks)
+│   ├── confidence.py    ★ Tier 1 — per-check confidence scoring engine (0–100)
+│   ├── session_health.py ★ Tier 1 — session health monitor + auto re-authentication
+│   ├── ai_triage.py     ★ Tier 2 — AI Triage + tech-aware prompts (11 stacks) + 7 providers
+│   ├── ai_chat.py       ★ Interactive multi-turn AI chat about scan results
+│   ├── orchestrator.py  ★ Phase 1 — Auto Orchestrator + 9 external tool runners + Windows PATH
+│   ├── watchmode.py     ★ Phase 2 — Watch Mode, ScanDatabase (SQLite), AlertManager
+│   ├── paramfuzz.py     ParamFuzzer + 9 DeepFuzzCheck subclasses (deduped, baseline-aware)
+│   ├── dirhunt.py       DirectoryHunter
+│   ├── subdomain.py     SubdomainHunter
+│   └── login.py         FormLoginHandler
+├── output/
+│   ├── reporter.py      JSON / CSV / JSONL / HTML (OOB + AI triage + confidence + orchestrator)
+│   ├── report_builder.py ★ Tier 2 — Pro report: CVSS, PoC curl commands, Nuclei templates
+│   ├── nuclei_gen.py    ★ Tier 3 — Nuclei YAML template generator (4 categories + run.sh)
+│   ├── burp_export.py   ★ Burp Suite XML export
+│   └── dashboard.py     ★ Live curses terminal dashboard (log-suppression safe)
+└── utils/
+    ├── constants.py     Regex patterns, wordlists, tech/WAF signatures
+    ├── helpers.py       Colors, logging (suppress-aware), URL helpers
+    ├── http.py          curl_cffi TLS spoofing, SPA auto-detection, XHR interception
+    ├── checkpoint.py    ★ Tier 3 — Smart phase-aware JSON checkpoint + PhaseManager
+    └── scope_diff.py    ★ Tier 3 — ScopeDiffer, ScopeValidator, HackerOne/Bugcrowd APIs
 ```
 
 ---
 
 ## Known Limitations
 
-- **SSRF detection is reflection-only.** Blind SSRF requires Burp Collaborator or interactsh.
-- **IDOR detection is heuristic.** Confirm findings manually.
-- **Form login is single-step.** OTP, CAPTCHA, OAuth, MFA not supported.
-- **No path-scope filtering.** Scope is by domain/host, not URL path prefix.
-- **DNS fallback.** Without `dnspython`, subdomain brute uses `socket.gethostbyname` (one A record only).
-- **Deep fuzz is not a full scanner.** Black-box heuristics — confirm all findings manually.
+- **OOB requires outbound DNS.** Firewalled internal networks may block DNS callbacks — use `--oob-server` with an internal interactsh instance.
+- **OOB callback wait is 8 seconds.** Some very slow servers (WAFs, rate limiters) may fire callbacks after this window. Increase via `OOB_CALLBACK_WAIT_S` in `oob.py`.
+- **IDOR detection is heuristic.** Confidence scoring helps reduce FPs but always confirm manually.
+- **Session health uses string matching.** Tokens embedded in JS (`window.__user`) won't be detected — use `--auth-check-url` pointing to an API endpoint that returns 401 on session expiry instead.
+- **Form login is single-step.** OTP, CAPTCHA, OAuth, and MFA are not supported.
+- **Confidence scoring is not infallible.** WAF-generated 500 errors can inflate SQLi scores. Manual verification of POSSIBLE-tier findings is always recommended before reporting.
+- **AI triage is advisory.** All findings should be verified manually before submitting to a bug bounty program.
 
 ---
 
@@ -454,4 +617,4 @@ This tool is for **authorized security testing and educational use only**.
 
 ---
 
-*Created by Boltx*
+*Created by Boltx — ParamSpecter v7.4*
